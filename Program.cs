@@ -55,7 +55,6 @@ namespace ToolCallingScratch
 
                 var client = await Measure(() => model.GetChatClientAsync(), "Getting chat client");
                 client.Settings.Temperature = 0;
-                client.Settings.ToolChoice = ToolChoice.Auto;
 
                 List<ChatMessage> messages = [
                     new("system", "You provide weather forecast information using a tool."),
