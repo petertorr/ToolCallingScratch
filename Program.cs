@@ -218,7 +218,9 @@ namespace ToolCallingScratch
                 {
                     var toolCall = message.ToolCalls![0].FunctionCall!;
                     var funcArgs = toolCall.ParseArguments();
-                    if (toolCall.Name == "getWeather" && funcArgs.TryGetValue("city", out var city) && city.Equals("Seattle"))
+                    if (toolCall.Name == toolDefinition.Function!.Name 
+                        && funcArgs.TryGetValue("city", out var city) 
+                        && city.ToString()!.Equals("Seattle"))
                     {
                         WriteLine($"`gSUCCESS: Correct tool-call syntax.");
                         exitCode = ExitCode.Success;
