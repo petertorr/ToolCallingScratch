@@ -4,6 +4,7 @@ using Betalgo.Ranul.OpenAI.ObjectModels.SharedModels;
 using Microsoft.AI.Foundry.Local;
 using Microsoft.Extensions.Logging.Abstractions;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.InteropServices;
 
 namespace ToolCallingScratch
@@ -59,9 +60,12 @@ namespace ToolCallingScratch
 
                 if (modelName.Equals("all", StringComparison.OrdinalIgnoreCase))
                 {
-                    return (int)await RunAll(catalog, requireTools);
+                    return (int)await RunAllAsync(catalog, requireTools);
                 }
-
+                else if (modelName.Equals("list", StringComparison.OrdinalIgnoreCase))
+                {
+                    return (int)await ListAll(catalog);
+                }
                 var model = (await Measure(() => catalog.GetModelAsync(modelName), $"Getting model {modelName}"));
                 return (int)await RunOne(model, requireTools);
             }
@@ -74,11 +78,15 @@ namespace ToolCallingScratch
 
                 ColorWriteLine($"""
                     `m
-                    Usage: {Path.GetFileNameWithoutExtension(Environment.ProcessPath)} <modelAlias> [requireTools]
+                    Usage 1: {Path.GetFileNameWithoutExtension(Environment.ProcessPath)} <modelAlias> [requireTools]
+                             Checks the given model (or all models) for successful tool-calling ability.
 
-                        <modelAlias>    is either an alias (like 'qwen2.5-7b') or the special value 'all' to run all models.
-                        [requireTools]  optional; whether to require the use of tools (default is 'false').
+                             <modelAlias>    is either an alias (like 'qwen2.5-7b') or the special value 'all' to run all models.
+                             [requireTools]  optional; whether to require the use of tools (default is 'false').
                     
+                    Usage 2: {Path.GetFileNameWithoutExtension(Environment.ProcessPath)} list
+                             Lists all models that "should" support tool-calling, according to their metadata.
+                                        
                     Exit code is 0 for success, > 0 for an error.
                     """);
 
@@ -88,7 +96,7 @@ namespace ToolCallingScratch
 
         static async Task<ExitCode> RunOne(IModel? model, bool requireTools)
         {
-            if (!IsCandidateModel(model))
+            if (!IsCandidateModel(model, true))
             {
                 return ExitCode.Other;
             }
@@ -145,6 +153,7 @@ namespace ToolCallingScratch
                     if (toolCall.Name == "getWeather" && funcArgs.ContainsKey("city"))
                     {
                         ColorWriteLine($"`gSUCCESS: Correct tool-call syntax.");
+                        exitCode = ExitCode.Success;
                     }
                     else
                     {
@@ -172,56 +181,95 @@ namespace ToolCallingScratch
             return exitCode;
         }
 
-        static bool IsCandidateModel(IModel? model)
+        static bool IsCandidateModel([NotNullWhen(true)] IModel? model, bool showInfo)
         {
             if (model is null)
             {
-                ColorWriteLine($"`oThe model you chose does not exist.");
+                if (showInfo)
+                {
+                    ColorWriteLine($"`oThe model you chose does not exist.");
+                }
                 return false;
             }
             if (!model.Info.SupportsToolCalling.HasValue || model.Info.SupportsToolCalling.Value == false)
             {
-                ColorWriteLine($"`cModel {model.Info.Name} doesn't support tool calling; ignoring.");
+                if (showInfo)
+                {
+                    ColorWriteLine($"`cModel {model.Info.Name} doesn't support tool calling; ignoring.");
+                }
                 return false;
             }
             if (model.Info.FileSizeMb > 8_192)
             {
-                ColorWriteLine($"`cModel {model.Info.Name} is too large ({model.Info.FileSizeMb:N} MB); ignoring.");
+                if (showInfo)
+                {
+                    ColorWriteLine($"`cModel {model.Info.Name} is too large ({model.Info.FileSizeMb:N} MB); ignoring.");
+                }
                 return false;
             }
 
             return true;
         }
 
-        static async Task<ExitCode> RunAll(ICatalog catalog, bool requireTools)
+        static async Task<ExitCode> ListAll(ICatalog catalog)
         {
-            var results = new List<string>[] { [], [], [], [], [], [] }; // one per exit code. 'badarg' and 'other' shouldn't happen...
-            int count = 0;
+            var result = await EnumerateAllCandidateModelsAsync(catalog, model =>
+            {
+                ColorWrite($"`c{model.Alias}");
+                ColorWriteLine(model.Info.Runtime!.DeviceType switch
+                {
+                    DeviceType.GPU => "`g (GPU)",
+                    DeviceType.NPU => "`m (NPU)",
+                    DeviceType.CPU => "`d (CPU)",
+                    _ => "`r (Invalid)"
+                });
+                return Task.CompletedTask;
+            }, false);
+
+            return result.Acceptable > 0 ? ExitCode.Success : ExitCode.Other;
+        }
+
+        record class ModelCounts(int Acceptable, int Ignored);
+
+        static async Task<ModelCounts> EnumerateAllCandidateModelsAsync(ICatalog catalog, Func<IModel, Task> callback, bool showInfo)
+        {
+            int acceptable = 0;
             int ignored = 0;
 
             foreach (var model in await Measure(() => catalog.ListModelsAsync(), "Getting list of models"))
             {
-                if (!IsCandidateModel(model))
+                if (!IsCandidateModel(model, showInfo))
                 {
                     ignored++;
                     continue;
                 }
 
-                count++;
-                results[(int)await RunOne(model, requireTools)].Add(model.Info.Alias);
+                acceptable++;
+                await callback(model);
             }
+
+            return new(acceptable, ignored);
+        }
+
+        static async Task<ExitCode> RunAllAsync(ICatalog catalog, bool requireTools)
+        {
+            var results = new List<string>[] { [], [], [], [], [], [] }; // one per exit code. 'badarg' and 'other' shouldn't happen...
+
+            var totals = await EnumerateAllCandidateModelsAsync(catalog, 
+                async model => results[(int)await RunOne(model, requireTools)].Add(model.Info.Alias), 
+                true);
 
             ColorWriteLine($"""
                 `w
                 Results
                 =======
-                Success: {results[(int)ExitCode.Success].Count} {string.Join(", ", results[(int)ExitCode.Success])}
-                Partial: {results[(int)ExitCode.Partial].Count} {string.Join(", ", results[(int)ExitCode.Partial])}
-                Fail:    {results[(int)ExitCode.Fail].Count} {string.Join(", ", results[(int)ExitCode.Fail])}
-                Timeout: {results[(int)ExitCode.Timeout].Count} {string.Join(", ", results[(int)ExitCode.Timeout])}
+                Success:   {results[(int)ExitCode.Success].Count} {string.Join(", ", results[(int)ExitCode.Success])}
+                Partial:   {results[(int)ExitCode.Partial].Count} {string.Join(", ", results[(int)ExitCode.Partial])}
+                Fail:      {results[(int)ExitCode.Fail].Count} {string.Join(", ", results[(int)ExitCode.Fail])}
+                Timeout:   {results[(int)ExitCode.Timeout].Count} {string.Join(", ", results[(int)ExitCode.Timeout])}
                 Exception: {results[(int)ExitCode.Exception].Count} {string.Join(", ", results[(int)ExitCode.Exception])}
-                Ignored: {ignored}
-                Total: {count + ignored}
+                Ignored:   {totals.Ignored}
+                Total:     {totals.Acceptable + totals.Ignored}
                 """);
 
             return ExitCode.Success;
@@ -243,6 +291,7 @@ namespace ToolCallingScratch
             {
                 'r' => ConsoleColor.Red,
                 'g' => ConsoleColor.Green,
+                'n' => ConsoleColor.DarkGreen,
                 'y' => ConsoleColor.Yellow,
                 'o' => ConsoleColor.DarkYellow,
                 'm' => ConsoleColor.Magenta,
@@ -271,6 +320,7 @@ namespace ToolCallingScratch
         }
 
         const int maxErrorMessageLength = 300;
+
         // ONNX tends to put the entire stack track and / or a lot of context into the "Message".
         // It also doesn't always use Environment.Newline for newlines.
         static string GetExceptionMessage(Exception ex)
