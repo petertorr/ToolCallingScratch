@@ -10,27 +10,51 @@ namespace ToolCallingScratch
 {
     internal class Program
     {
+        static async Task Measure(Func<Task> f, string description)
+        {
+            await Measure(async Task<bool>() => { await f(); return true; }, description);
+        }
+
+        static async Task<T> Measure<T>(Func<Task<T>> f, string description)
+        {
+            Console.ForegroundColor = ConsoleColor.DarkGray;
+            Console.Write($"{description}...");
+            var sw = Stopwatch.StartNew();
+            var t = await f();
+            sw.Stop();
+            Console.WriteLine($" it took {sw.ElapsedMilliseconds:N0} ms");
+            Console.ResetColor();
+            return t;
+        }
+
         static async Task<int> Main(string[] args)
         {
             IModel? model = null;
             try
             {
-                Console.WriteLine($"Initializing architecture {RuntimeInformation.ProcessArchitecture}; this may take several minutes...");
-                var sw = Stopwatch.StartNew();
-                await FoundryLocalManager.CreateAsync(new() { AppName = "ToolCallingScratch" }, NullLogger.Instance);
+                Console.WriteLine($"Architecture is {RuntimeInformation.ProcessArchitecture}...");
+                await Measure(() => FoundryLocalManager.CreateAsync(new() { AppName = "ToolCallingScratch" }, NullLogger.Instance), "Creating instance");
                 using var instance = FoundryLocalManager.Instance;
-                var eps = await instance.DownloadAndRegisterEpsAsync();
-                var catalog = await instance.GetCatalogAsync();
-                model = (await catalog.GetModelAsync("qwen2.5-7b"))!;
-                await model.DownloadAsync();
-                await model.LoadAsync();
-                var client = await model.GetChatClientAsync();
+
+                var eps = await Measure(() => instance.DownloadAndRegisterEpsAsync(), "Registering EPs");
+                Console.WriteLine($"Registered EPs: {string.Join(", ", eps.RegisteredEps)}.");
+
+                var catalog = await Measure(() => instance.GetCatalogAsync(), "Getting catalog");
+                model = (await Measure(() => catalog.GetModelAsync("qwen2.5-7b"), "Getting model"))!;
+
+                // Don't bother timing this...
+                bool iscached = await model.IsCachedAsync();
+                if (!iscached)
+                {
+                    await Measure(() => model.DownloadAsync(), "Downloading model");
+                }
+
+                await Measure(() => model.LoadAsync(), "Loading model");
+                Console.WriteLine($"Model full name: {model.Id}");
+
+                var client = await Measure(() => model.GetChatClientAsync(), "Getting chat client");
                 client.Settings.Temperature = 0;
                 client.Settings.ToolChoice = ToolChoice.Required;
-                sw.Stop();
-                Console.WriteLine($"Initialization took {sw.ElapsedMilliseconds:N0}ms");
-                Console.WriteLine($"Registered EPs: {string.Join(", ", eps.RegisteredEps)}.");
-                Console.WriteLine($"Model full name: {model.Id}");
 
                 List<ChatMessage> messages = [
                     new("system", "You provide weather forecast information using a tool."),
@@ -41,10 +65,7 @@ namespace ToolCallingScratch
                 builder.AddParameter("city", PropertyDefinition.DefineString("The name of the city to get the weather for."), true);
                 var tool = ToolDefinition.DefineFunction(builder.Build());
 
-                sw = Stopwatch.StartNew();
-                var response = await client.CompleteChatAsync(messages, [tool]);
-                sw.Stop();
-                Console.WriteLine($"Chat completion took {sw.ElapsedMilliseconds:N0}ms");
+                var response = await Measure(() => client.CompleteChatAsync(messages, [tool]), "Sending prompt");
 
                 var reply = response.Choices[0]!;
                 Console.WriteLine($"Verbatim response:{Environment.NewLine}{reply.Message.Content}");
