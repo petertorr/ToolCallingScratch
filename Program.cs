@@ -29,6 +29,7 @@ namespace ToolCallingScratch
 
         static async Task<int> Main(string[] args)
         {
+            string modelName = args.FirstOrDefault() ?? "qwen2.5-7b";
             IModel? model = null;
             try
             {
@@ -40,7 +41,7 @@ namespace ToolCallingScratch
                 Console.WriteLine($"Registered EPs: {string.Join(", ", eps.RegisteredEps)}.");
 
                 var catalog = await Measure(() => instance.GetCatalogAsync(), "Getting catalog");
-                model = (await Measure(() => catalog.GetModelAsync("qwen2.5-7b"), "Getting model"))!;
+                model = (await Measure(() => catalog.GetModelAsync(modelName), $"Getting model {modelName}"))!;
 
                 // Don't bother timing this...
                 bool iscached = await model.IsCachedAsync();
@@ -54,7 +55,7 @@ namespace ToolCallingScratch
 
                 var client = await Measure(() => model.GetChatClientAsync(), "Getting chat client");
                 client.Settings.Temperature = 0;
-                client.Settings.ToolChoice = ToolChoice.Required;
+                client.Settings.ToolChoice = ToolChoice.Auto;
 
                 List<ChatMessage> messages = [
                     new("system", "You provide weather forecast information using a tool."),
@@ -72,8 +73,18 @@ namespace ToolCallingScratch
 
                 if (reply.FinishReason == "tool_calls")
                 {
-                    Console.ForegroundColor = ConsoleColor.Green;
-                    Console.WriteLine($"SUCCESS: Correct tool-call syntax.");
+                    var toolCall = reply.Message!.ToolCalls![0].FunctionCall;
+                    var funcArgs = toolCall!.ParseArguments();
+                    if (toolCall.Name == "getWeather" && funcArgs.ContainsKey("city"))
+                    {
+                        Console.ForegroundColor = ConsoleColor.Green;
+                        Console.WriteLine($"SUCCESS: Correct tool-call syntax.");
+                    }
+                    else
+                    {
+                        Console.ForegroundColor = ConsoleColor.Yellow;
+                        Console.WriteLine($"PARTIAL: Correct tool-call syntax, but wrong name / params.");
+                    }
                     Console.ResetColor();
                     return 0;
                 }

@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "ToolCallingScratch": {
+      "commandName": "Project",
+      "commandLineArgs": "qwen2.5-1.5b"
+    }
+  }
+}
