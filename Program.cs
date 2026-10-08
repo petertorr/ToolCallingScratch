@@ -12,7 +12,7 @@ namespace ToolCallingScratch
     {
         static async Task Measure(Func<Task> f, string description)
         {
-            await Measure(async Task<bool>() => { await f(); return true; }, description);
+            await Measure(async Task<bool> () => { await f(); return true; }, description);
         }
 
         static async Task<T> Measure<T>(Func<Task<T>> f, string description)
@@ -33,28 +33,19 @@ namespace ToolCallingScratch
             IModel? model = null;
             try
             {
-                Console.WriteLine($"Architecture is {RuntimeInformation.ProcessArchitecture}...");
                 await Measure(() => FoundryLocalManager.CreateAsync(new() { AppName = "ToolCallingScratch" }, NullLogger.Instance), "Creating instance");
                 using var instance = FoundryLocalManager.Instance;
 
                 var eps = await Measure(() => instance.DownloadAndRegisterEpsAsync(), "Registering EPs");
-                Console.WriteLine($"Registered EPs: {string.Join(", ", eps.RegisteredEps)}.");
 
                 var catalog = await Measure(() => instance.GetCatalogAsync(), "Getting catalog");
                 model = (await Measure(() => catalog.GetModelAsync(modelName), $"Getting model {modelName}"))!;
-
-                // Don't bother timing this...
-                bool iscached = await model.IsCachedAsync();
-                if (!iscached)
-                {
-                    await Measure(() => model.DownloadAsync(), "Downloading model");
-                }
-
+                await Measure(() => model.DownloadAsync(), "Downloading model");
                 await Measure(() => model.LoadAsync(), "Loading model");
-                Console.WriteLine($"Model full name: {model.Id}");
 
                 var client = await Measure(() => model.GetChatClientAsync(), "Getting chat client");
-                client.Settings.Temperature = 0;
+                client.Settings.Temperature = 0.001f;
+                client.Settings.ToolChoice = ToolChoice.Auto; // DO NOT set to "Required"; nothing works then!
 
                 List<ChatMessage> messages = [
                     new("system", "You provide weather forecast information using a tool."),
@@ -65,10 +56,21 @@ namespace ToolCallingScratch
                 builder.AddParameter("city", PropertyDefinition.DefineString("The name of the city to get the weather for."), true);
                 var tool = ToolDefinition.DefineFunction(builder.Build());
 
+                Console.WriteLine($"Architecture: {RuntimeInformation.ProcessArchitecture}.");
+                Console.WriteLine($"Registered EPs: {string.Join(", ", eps.RegisteredEps)}.");
+                if (eps.FailedEps.Length > 0)
+                {
+                    Console.ForegroundColor = ConsoleColor.Red;
+                    Console.WriteLine($"Failed EPs: {string.Join(", ", eps.FailedEps)}.");
+                    Console.ResetColor();
+                }
+
+                Console.WriteLine($"Model full name: {model.Id}");
+
                 var response = await Measure(() => client.CompleteChatAsync(messages, [tool]), "Sending prompt");
 
                 var reply = response.Choices[0]!;
-                Console.WriteLine($"Verbatim response:{Environment.NewLine}{reply.Message.Content}");
+                Console.WriteLine($"Verbatim response:{Environment.NewLine}---{Environment.NewLine}{reply.Message.Content}{Environment.NewLine}---");
 
                 if (reply.FinishReason == "tool_calls")
                 {
@@ -82,7 +84,7 @@ namespace ToolCallingScratch
                     else
                     {
                         Console.ForegroundColor = ConsoleColor.Yellow;
-                        Console.WriteLine($"PARTIAL: Correct tool-call syntax, but wrong name / params.");
+                        Console.WriteLine($"PARTIAL: Correct tool-call syntax, but incorrect data.");
                     }
                     Console.ResetColor();
                     return 0;
