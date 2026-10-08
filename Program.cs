@@ -19,25 +19,37 @@ namespace ToolCallingScratch
         Other = 99
     }
 
+    record class ModelCounts(int Acceptable, int Ignored)
+    {
+        public int Total => Acceptable + Ignored;
+    }
+
     internal class Program
     {
-        static async Task Measure(Func<Task> f, string description)
-        {
-            await Measure(async Task<bool> () => { await f(); return true; }, description);
-        }
-
-        static async Task<T> Measure<T>(Func<Task<T>> f, string description)
-        {
-            ColorWrite($"`d{description}...");
-            var sw = Stopwatch.StartNew();
-            var t = await f();
-            sw.Stop();
-            ColorWriteLine($"`d it took {sw.ElapsedMilliseconds:N0} ms");
-            return t;
-        }
+        static readonly List<ChatMessage> messages =
+                [
+                    new("system", "You provide weather forecast information using a tool."),
+                    new("user", "What is the weather in Seattle?")
+                ];
+        static readonly ToolDefinition toolDefinition = ToolDefinition.DefineFunction(
+            new FunctionDefinitionBuilder("getWeather", "Returns the weather for a specific city, in degrees celcius.")
+            .AddParameter("city", PropertyDefinition.DefineString("The name of the city to get the weather for."), true)
+            .Build());
+        const int chatTimeoutInSeconds = 60 * 1; // Time to wait for an answer. It's a trivial prompt...
+        const int maxErrorMessageLength = 300; // Truncate error messages longer than this.
+        const int maxFileSizeInMb = 8_192; // Max model size we want to support.
 
         static async Task<int> Main(string[] args)
         {
+            if (args.Length == 0 ||
+                args[0].Equals("-h", StringComparison.OrdinalIgnoreCase) ||
+                args[0].Equals("--help", StringComparison.OrdinalIgnoreCase))
+            {
+                Usage();
+                return (int)ExitCode.Other;
+            }
+
+            var sw = Stopwatch.StartNew();
             try
             {
                 string modelName = args[0];
@@ -47,54 +59,71 @@ namespace ToolCallingScratch
                     requireTools = bool.Parse(args[1]);
                 }
 
-                await Measure(() => FoundryLocalManager.CreateAsync(new() { AppName = "ToolCallingScratch" }, NullLogger.Instance), "Creating instance");
+                await TimeActionAsync(() => FoundryLocalManager.CreateAsync(new() { AppName = "ToolCallingScratch" }, NullLogger.Instance), "Creating instance");
                 using var instance = FoundryLocalManager.Instance;
-                var eps = await Measure(() => instance.DownloadAndRegisterEpsAsync(), "Registering EPs");
-                var catalog = await Measure(() => instance.GetCatalogAsync(), "Getting catalog");
-                ColorWriteLine($"`bArchitecture: {RuntimeInformation.ProcessArchitecture}.");
-                ColorWriteLine($"`bRegistered EPs: {string.Join(", ", eps.RegisteredEps)}.");
+                var eps = await TimeActionAsync(() => instance.DownloadAndRegisterEpsAsync(), "Registering EPs");
+                var catalog = await TimeActionAsync(() => instance.GetCatalogAsync(), "Getting catalog");
+                WriteLine($"`bArchitecture: {RuntimeInformation.ProcessArchitecture}.");
+                WriteLine($"`bRegistered EPs: {string.Join(", ", eps.RegisteredEps)}.");
                 if (eps.FailedEps.Length > 0)
                 {
-                    ColorWriteLine($"`rFailed EPs: {string.Join(", ", eps.FailedEps)}.");
+                    WriteLine($"`rFailed EPs: {string.Join(", ", eps.FailedEps)}.");
+                }
+                if (modelName.Equals("list", StringComparison.OrdinalIgnoreCase))
+                {
+                    return (int)await ListAllModelsAsync(catalog);
                 }
 
                 if (modelName.Equals("all", StringComparison.OrdinalIgnoreCase))
                 {
-                    return (int)await RunAllAsync(catalog, requireTools);
+                    return (int)await RunAllModelsAsync(catalog, requireTools);
                 }
-                else if (modelName.Equals("list", StringComparison.OrdinalIgnoreCase))
-                {
-                    return (int)await ListAll(catalog);
-                }
-                var model = (await Measure(() => catalog.GetModelAsync(modelName), $"Getting model {modelName}"));
-                return (int)await RunOne(model, requireTools);
+
+                var model = (await TimeActionAsync(() => catalog.GetModelAsync(modelName), $"Getting model {modelName}"));
+                return (int)await RunOneModelAsync(model, requireTools);
             }
             catch (Exception ex)
             {
-                if (ex is not IndexOutOfRangeException)
-                {
-                    ColorWriteLine($"`r{Environment.NewLine}ERROR: {ex.Message}");
-                }
-
-                ColorWriteLine($"""
-                    `m
-                    Usage 1: {Path.GetFileNameWithoutExtension(Environment.ProcessPath)} <modelAlias> [requireTools]
-                             Checks the given model (or all models) for successful tool-calling ability.
-
-                             <modelAlias>    is either an alias (like 'qwen2.5-7b') or the special value 'all' to run all models.
-                             [requireTools]  optional; whether to require the use of tools (default is 'false').
-                    
-                    Usage 2: {Path.GetFileNameWithoutExtension(Environment.ProcessPath)} list
-                             Lists all models that "should" support tool-calling, according to their metadata.
-                                        
-                    Exit code is 0 for success, > 0 for an error.
-                    """);
-
+                WriteLine($"`r{Environment.NewLine}ERROR: {ex.Message}");
+                Usage();
                 return (int)ExitCode.Other;
+            }
+            finally
+            {
+                WriteLine($"`d[Total time: {sw.Elapsed.TotalSeconds:N2} seconds]");
             }
         }
 
-        static async Task<ExitCode> RunOne(IModel? model, bool requireTools)
+        static void Usage()
+        {
+            WriteLine($"""
+                `b
+                Usage 1: {Path.GetFileNameWithoutExtension(Environment.ProcessPath)} <modelAlias> [requireTools]
+                            Checks the given model (or all models) for successful tool-calling ability.
+
+                            <modelAlias>    is either an alias (like 'qwen2.5-7b') or the special value 'all' to run all models.
+                            [requireTools]  optional; whether to require the use of tools (default is 'false').
+                    
+                Usage 2: {Path.GetFileNameWithoutExtension(Environment.ProcessPath)} list
+                            Lists all models that "should" support tool-calling, according to their metadata.
+                                        
+                Exit code is 0 for success, > 0 for an error.
+                """);
+        }
+
+        static async Task<ExitCode> ListAllModelsAsync(ICatalog catalog)
+        {
+            var result = await EnumerateAllCandidateModelsAsync(catalog, model =>
+            {
+                Write($"`c{model.Alias}");
+                WriteLine(GetDeviceTypeInColor(model));
+                return Task.CompletedTask;
+            }, false);
+
+            return result.Acceptable > 0 ? ExitCode.Success : ExitCode.Other;
+        }
+
+        static async Task<ExitCode> RunOneModelAsync(IModel? model, bool requireTools)
         {
             if (!IsCandidateModel(model, true))
             {
@@ -104,16 +133,16 @@ namespace ToolCallingScratch
             ShowModelInfo(model, requireTools);
             try
             {
-                await Measure(() => model.DownloadAsync(), "Downloading model");
-                await Measure(() => model.LoadAsync(), "Loading model");
-                var client = await Measure(() => model.GetChatClientAsync(), "Getting chat client");
+                await TimeActionAsync(() => model.DownloadAsync(), "Downloading model");
+                await TimeActionAsync(() => model.LoadAsync(), "Loading model");
+                var client = await TimeActionAsync(() => model.GetChatClientAsync(), "Getting chat client");
                 client.Settings.Temperature = 0.001f;
                 client.Settings.ToolChoice = requireTools ? ToolChoice.Required : ToolChoice.Auto;
-                return await RunOnePrompt(client);
+                return await ExecutePromptAsync(client);
             }
             catch (Exception ex)
             {
-                ColorWriteLine($"`r{Environment.NewLine}ERROR: Cannot load model:{Environment.NewLine}{GetExceptionMessage(ex)}");
+                WriteLine($"`r{Environment.NewLine}ERROR: Cannot load model:{Environment.NewLine}{GetExceptionMessage(ex)}");
                 return ExitCode.Exception;
             }
             finally
@@ -122,29 +151,40 @@ namespace ToolCallingScratch
             }
         }
 
-        static readonly List<ChatMessage> messages =
-                [
-                    new("system", "You provide weather forecast information using a tool."),
-                    new("user", "What is the weather in Seattle?")
-                ];
+        static async Task<ExitCode> RunAllModelsAsync(ICatalog catalog, bool requireTools)
+        {
+            var results = new List<string>[] { [], [], [], [], [], [] }; // one per exit code. 'badarg' and 'other' shouldn't happen...
 
-        static readonly ToolDefinition toolDefinition = ToolDefinition.DefineFunction(
-            new FunctionDefinitionBuilder("getWeather", "Returns the weather for a specific city, in degrees celcius.")
-            .AddParameter("city", PropertyDefinition.DefineString("The name of the city to get the weather for."), true)
-            .Build());
+            var totals = await EnumerateAllCandidateModelsAsync(catalog,
+                async model => results[(int)await RunOneModelAsync(model, requireTools)].Add(model.Info.Alias),
+                true);
 
-        const int chatTimeoutInSeconds = 60 * 3;
+            WriteLine($"""
+                `w
+                Results
+                =======
+                  Success ({results[(int)ExitCode.Success].Count,2}): {string.Join(", ", results[(int)ExitCode.Success])}
+                  Partial ({results[(int)ExitCode.Partial].Count,2}): {string.Join(", ", results[(int)ExitCode.Partial])}
+                     Fail ({results[(int)ExitCode.Fail].Count,2}): {string.Join(", ", results[(int)ExitCode.Fail])}
+                  Timeout ({results[(int)ExitCode.Timeout].Count,2}): {string.Join(", ", results[(int)ExitCode.Timeout])}
+                Exception ({results[(int)ExitCode.Exception].Count,2}): {string.Join(", ", results[(int)ExitCode.Exception])}
+                  Ignored  {totals.Ignored}
+                    Total  {totals.Total}
+                """);
 
-        static async Task<ExitCode> RunOnePrompt(OpenAIChatClient client)
+            return ExitCode.Success;
+        }
+
+        static async Task<ExitCode> ExecutePromptAsync(OpenAIChatClient client)
         {
             ExitCode exitCode = ExitCode.Fail;
             try
             {
 
-                var response = await Measure(() => client.CompleteChatAsync(messages, [toolDefinition], new CancellationTokenSource(TimeSpan.FromSeconds(chatTimeoutInSeconds)).Token), "Sending prompt");
+                var response = await TimeActionAsync(() => client.CompleteChatAsync(messages, [toolDefinition], new CancellationTokenSource(TimeSpan.FromSeconds(chatTimeoutInSeconds)).Token), "Sending prompt");
                 var reply = response.Choices[0]!;
 
-                ColorWriteLine($"`aVerbatim response:{Environment.NewLine}---{Environment.NewLine}{reply.Message.Content}{Environment.NewLine}---");
+                WriteLine($"`aVerbatim response:{Environment.NewLine}---{Environment.NewLine}{reply.Message.Content}{Environment.NewLine}---");
 
                 if (reply.FinishReason == "tool_calls")
                 {
@@ -152,91 +192,41 @@ namespace ToolCallingScratch
                     var funcArgs = toolCall!.ParseArguments();
                     if (toolCall.Name == "getWeather" && funcArgs.ContainsKey("city"))
                     {
-                        ColorWriteLine($"`gSUCCESS: Correct tool-call syntax.");
+                        WriteLine($"`gSUCCESS: Correct tool-call syntax.");
                         exitCode = ExitCode.Success;
                     }
                     else
                     {
-                        ColorWriteLine($"`yPARTIAL: Correct tool-call syntax, but incorrect data.");
+                        WriteLine($"`yPARTIAL: Correct tool-call syntax, but incorrect data.");
                         exitCode = ExitCode.Partial;
                     }
                 }
                 else
                 {
-                    ColorWriteLine($"`rFAIL: Incorrect tool-call syntax.");
+                    WriteLine($"`rFAIL: Incorrect tool-call syntax.");
                     exitCode = ExitCode.Fail;
                 }
             }
             catch (TaskCanceledException)
             {
-                ColorWriteLine($"`rFAIL: Chat took longer than {chatTimeoutInSeconds} seconds to respond.");
+                WriteLine($"`rFAIL: Chat took longer than {chatTimeoutInSeconds} seconds to respond.");
                 exitCode = ExitCode.Timeout;
             }
             catch (Exception ex)
             {
-                ColorWriteLine($"`rFAIL: Runtime error.{Environment.NewLine}{GetExceptionMessage(ex)}");
+                WriteLine($"`rFAIL: Runtime error.{Environment.NewLine}{GetExceptionMessage(ex)}");
                 exitCode = ExitCode.Exception;
             }
 
             return exitCode;
         }
 
-        static bool IsCandidateModel([NotNullWhen(true)] IModel? model, bool showInfo)
-        {
-            if (model is null)
-            {
-                if (showInfo)
-                {
-                    ColorWriteLine($"`oThe model you chose does not exist.");
-                }
-                return false;
-            }
-            if (!model.Info.SupportsToolCalling.HasValue || model.Info.SupportsToolCalling.Value == false)
-            {
-                if (showInfo)
-                {
-                    ColorWriteLine($"`cModel {model.Info.Name} doesn't support tool calling; ignoring.");
-                }
-                return false;
-            }
-            if (model.Info.FileSizeMb > 8_192)
-            {
-                if (showInfo)
-                {
-                    ColorWriteLine($"`cModel {model.Info.Name} is too large ({model.Info.FileSizeMb:N} MB); ignoring.");
-                }
-                return false;
-            }
-
-            return true;
-        }
-
-        static async Task<ExitCode> ListAll(ICatalog catalog)
-        {
-            var result = await EnumerateAllCandidateModelsAsync(catalog, model =>
-            {
-                ColorWrite($"`c{model.Alias}");
-                ColorWriteLine(model.Info.Runtime!.DeviceType switch
-                {
-                    DeviceType.GPU => "`g (GPU)",
-                    DeviceType.NPU => "`m (NPU)",
-                    DeviceType.CPU => "`d (CPU)",
-                    _ => "`r (Invalid)"
-                });
-                return Task.CompletedTask;
-            }, false);
-
-            return result.Acceptable > 0 ? ExitCode.Success : ExitCode.Other;
-        }
-
-        record class ModelCounts(int Acceptable, int Ignored);
-
         static async Task<ModelCounts> EnumerateAllCandidateModelsAsync(ICatalog catalog, Func<IModel, Task> callback, bool showInfo)
         {
             int acceptable = 0;
             int ignored = 0;
 
-            foreach (var model in await Measure(() => catalog.ListModelsAsync(), "Getting list of models"))
+            foreach (var model in await TimeActionAsync(() => catalog.ListModelsAsync(), "Getting list of models"))
             {
                 if (!IsCandidateModel(model, showInfo))
                 {
@@ -251,33 +241,66 @@ namespace ToolCallingScratch
             return new(acceptable, ignored);
         }
 
-        static async Task<ExitCode> RunAllAsync(ICatalog catalog, bool requireTools)
+        static bool IsCandidateModel([NotNullWhen(true)] IModel? model, bool showInfo)
         {
-            var results = new List<string>[] { [], [], [], [], [], [] }; // one per exit code. 'badarg' and 'other' shouldn't happen...
+            if (model is null)
+            {
+                if (showInfo)
+                {
+                    WriteLine($"`oThe model you chose does not exist.");
+                }
+                return false;
+            }
+            if (!model.Info.SupportsToolCalling.HasValue || model.Info.SupportsToolCalling.Value == false)
+            {
+                if (showInfo)
+                {
+                    WriteLine($"`cModel {model.Info.Name} doesn't support tool calling; ignoring.");
+                }
+                return false;
+            }
+            if (model.Info.FileSizeMb > maxFileSizeInMb)
+            {
+                if (showInfo)
+                {
+                    WriteLine($"`cModel {model.Info.Name} is too large ({model.Info.FileSizeMb:N} MB); ignoring.");
+                }
+                return false;
+            }
 
-            var totals = await EnumerateAllCandidateModelsAsync(catalog, 
-                async model => results[(int)await RunOne(model, requireTools)].Add(model.Info.Alias), 
-                true);
-
-            ColorWriteLine($"""
-                `w
-                Results
-                =======
-                Success:   {results[(int)ExitCode.Success].Count} {string.Join(", ", results[(int)ExitCode.Success])}
-                Partial:   {results[(int)ExitCode.Partial].Count} {string.Join(", ", results[(int)ExitCode.Partial])}
-                Fail:      {results[(int)ExitCode.Fail].Count} {string.Join(", ", results[(int)ExitCode.Fail])}
-                Timeout:   {results[(int)ExitCode.Timeout].Count} {string.Join(", ", results[(int)ExitCode.Timeout])}
-                Exception: {results[(int)ExitCode.Exception].Count} {string.Join(", ", results[(int)ExitCode.Exception])}
-                Ignored:   {totals.Ignored}
-                Total:     {totals.Acceptable + totals.Ignored}
-                """);
-
-            return ExitCode.Success;
+            return true;
         }
 
-        static void ColorWriteLine(string content) => ColorWrite(content + Environment.NewLine);
+        static string GetDeviceTypeInColor(IModel model)
+        {
+            return model.Info.Runtime!.DeviceType switch
+            {
+                DeviceType.GPU => "`g (GPU)",
+                DeviceType.NPU => "`m (NPU)",
+                DeviceType.CPU => "`d (CPU)",
+                _ => "`r (Invalid)"
+            };
+        }
 
-        static void ColorWrite(string content)
+        static void ShowModelInfo(IModel model, bool requireTools)
+        {
+            Write($"""
+                `y{new string('-', 50)}
+                Alias: {model.Alias}, Full Name: {model.Info.Name}, Size: {model.Info.FileSizeMb:N} MB.
+                EP: {model.Info.Runtime!.ExecutionProvider}
+                """);
+            WriteLine(GetDeviceTypeInColor(model) + ".");
+
+            if (requireTools)
+            {
+                WriteLine($"`oForcing the use of tools.");
+            }
+            Console.ResetColor();
+        }
+
+        static void WriteLine(string content) => Write(content + Environment.NewLine);
+
+        static void Write(string content)
         {
             char color = ' ';
             // Can begin with "`x" where x is a color.
@@ -305,22 +328,6 @@ namespace ToolCallingScratch
             Console.ResetColor();
         }
 
-        static void ShowModelInfo(IModel model, bool requireTools)
-        {
-            ColorWriteLine($"""
-                `y{new string('-', 50)}
-                Name: {model.Info.Name} ({model.Info.FileSizeMb:N} MB).
-                EP: {model.Info.Runtime!.ExecutionProvider} running on the {model.Info.Runtime.DeviceType}.
-                """);
-            if (requireTools)
-            {
-                ColorWriteLine($"`oForcing the use of tools.");
-            }
-            Console.ResetColor();
-        }
-
-        const int maxErrorMessageLength = 300;
-
         // ONNX tends to put the entire stack track and / or a lot of context into the "Message".
         // It also doesn't always use Environment.Newline for newlines.
         static string GetExceptionMessage(Exception ex)
@@ -337,6 +344,21 @@ namespace ToolCallingScratch
             }
 
             return message;
+        }
+
+        static async Task TimeActionAsync(Func<Task> f, string description)
+        {
+            await TimeActionAsync(async Task<bool> () => { await f(); return true; }, description);
+        }
+
+        static async Task<T> TimeActionAsync<T>(Func<Task<T>> f, string description)
+        {
+            Write($"`d{description}...");
+            var sw = Stopwatch.StartNew();
+            var t = await f();
+            sw.Stop();
+            WriteLine($"`d it took {sw.ElapsedMilliseconds:N0} ms");
+            return t;
         }
     }
 }
