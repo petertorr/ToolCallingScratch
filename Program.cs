@@ -8,6 +8,17 @@ using System.Runtime.InteropServices;
 
 namespace ToolCallingScratch
 {
+    enum ExitCode
+    {
+        Success = 0,
+        Partial = 1,
+        Fail = 2,
+        Timeout = 3,
+        Exception = 4,
+        BadArgs = 5,
+        Other = 99
+    }
+
     internal class Program
     {
         static async Task Measure(Func<Task> f, string description)
@@ -17,60 +28,117 @@ namespace ToolCallingScratch
 
         static async Task<T> Measure<T>(Func<Task<T>> f, string description)
         {
-            Console.ForegroundColor = ConsoleColor.DarkGray;
-            Console.Write($"{description}...");
+            ColorWrite($"`d{description}...");
             var sw = Stopwatch.StartNew();
             var t = await f();
             sw.Stop();
-            Console.WriteLine($" it took {sw.ElapsedMilliseconds:N0} ms");
-            Console.ResetColor();
+            ColorWriteLine($"`d it took {sw.ElapsedMilliseconds:N0} ms");
             return t;
         }
 
         static async Task<int> Main(string[] args)
         {
-            string modelName = args.FirstOrDefault() ?? "qwen2.5-7b";
-            IModel? model = null;
             try
             {
+                string modelName = args[0];
+                bool requireTools = false;
+                if (args.Length > 1)
+                {
+                    requireTools = bool.Parse(args[1]);
+                }
+
                 await Measure(() => FoundryLocalManager.CreateAsync(new() { AppName = "ToolCallingScratch" }, NullLogger.Instance), "Creating instance");
                 using var instance = FoundryLocalManager.Instance;
-
                 var eps = await Measure(() => instance.DownloadAndRegisterEpsAsync(), "Registering EPs");
-
                 var catalog = await Measure(() => instance.GetCatalogAsync(), "Getting catalog");
-                model = (await Measure(() => catalog.GetModelAsync(modelName), $"Getting model {modelName}"))!;
+                ColorWriteLine($"`bArchitecture: {RuntimeInformation.ProcessArchitecture}.");
+                ColorWriteLine($"`bRegistered EPs: {string.Join(", ", eps.RegisteredEps)}.");
+                if (eps.FailedEps.Length > 0)
+                {
+                    ColorWriteLine($"`rFailed EPs: {string.Join(", ", eps.FailedEps)}.");
+                }
+
+                if (modelName.Equals("all", StringComparison.OrdinalIgnoreCase))
+                {
+                    return (int)await RunAll(catalog, requireTools);
+                }
+
+                var model = (await Measure(() => catalog.GetModelAsync(modelName), $"Getting model {modelName}"));
+                return (int)await RunOne(model, requireTools);
+            }
+            catch (Exception ex)
+            {
+                if (ex is not IndexOutOfRangeException)
+                {
+                    ColorWriteLine($"`rError: {ex.Message}");
+                }
+
+                ColorWriteLine($"""
+                    `y
+                    Usage: {Path.GetFileNameWithoutExtension(Environment.ProcessPath)} <modelAlias> [requireTools]
+
+                        <modelAlias>    is either an alias (like 'qwen2.5-7b') or the special value 'all' to run all models.
+                        [requireTools]  optional; whether to require the use of tools (default is 'false').
+                    
+                    Exit code is 0 for success, > 0 for an error.
+                    """);
+
+                return (int)ExitCode.Other;
+            }
+        }
+
+        static async Task<ExitCode> RunOne(IModel? model, bool requireTools)
+        {
+            if (model is null)
+            {
+                ColorWriteLine($"`rError: That model doesn't exit");
+                return ExitCode.BadArgs;
+            }
+
+            ShowModelInfo(model, requireTools);
+            try
+            {
                 await Measure(() => model.DownloadAsync(), "Downloading model");
                 await Measure(() => model.LoadAsync(), "Loading model");
-
                 var client = await Measure(() => model.GetChatClientAsync(), "Getting chat client");
                 client.Settings.Temperature = 0.001f;
-                client.Settings.ToolChoice = ToolChoice.Auto; // DO NOT set to "Required"; nothing works then!
+                client.Settings.ToolChoice = requireTools ? ToolChoice.Required : ToolChoice.Auto;
+                return await RunOnePrompt(client);
+            }
+            catch (Exception ex)
+            {
+                ColorWriteLine($"`rCannot load model:{Environment.NewLine}{GetExceptionMessage(ex)}");
+                return ExitCode.Exception;
+            }
+            finally
+            {
+                await model.UnloadAsync();
+            }
+        }
 
-                List<ChatMessage> messages = [
+        static readonly List<ChatMessage> messages =
+                [
                     new("system", "You provide weather forecast information using a tool."),
                     new("user", "What is the weather in Seattle?")
                 ];
 
-                FunctionDefinitionBuilder builder = new("getWeather", "Returns the weather for a specific city, in degrees celcius.");
-                builder.AddParameter("city", PropertyDefinition.DefineString("The name of the city to get the weather for."), true);
-                var tool = ToolDefinition.DefineFunction(builder.Build());
+        static readonly ToolDefinition toolDefinition = ToolDefinition.DefineFunction(
+            new FunctionDefinitionBuilder("getWeather", "Returns the weather for a specific city, in degrees celcius.")
+            .AddParameter("city", PropertyDefinition.DefineString("The name of the city to get the weather for."), true)
+            .Build());
 
-                Console.WriteLine($"Architecture: {RuntimeInformation.ProcessArchitecture}.");
-                Console.WriteLine($"Registered EPs: {string.Join(", ", eps.RegisteredEps)}.");
-                if (eps.FailedEps.Length > 0)
-                {
-                    Console.ForegroundColor = ConsoleColor.Red;
-                    Console.WriteLine($"Failed EPs: {string.Join(", ", eps.FailedEps)}.");
-                    Console.ResetColor();
-                }
+        const int chatTimeoutInSeconds = 60 * 3;
 
-                Console.WriteLine($"Model full name: {model.Id}");
+        static async Task<ExitCode> RunOnePrompt(OpenAIChatClient client)
+        {
+            ExitCode exitCode = ExitCode.Fail;
+            try
+            {
 
-                var response = await Measure(() => client.CompleteChatAsync(messages, [tool]), "Sending prompt");
-
+                var response = await Measure(() => client.CompleteChatAsync(messages, [toolDefinition], new CancellationTokenSource(TimeSpan.FromSeconds(chatTimeoutInSeconds)).Token), "Sending prompt");
                 var reply = response.Choices[0]!;
-                Console.WriteLine($"Verbatim response:{Environment.NewLine}---{Environment.NewLine}{reply.Message.Content}{Environment.NewLine}---");
+
+                ColorWriteLine($"`aVerbatim response:{Environment.NewLine}---{Environment.NewLine}{reply.Message.Content}{Environment.NewLine}---");
 
                 if (reply.FinishReason == "tool_calls")
                 {
@@ -78,35 +146,128 @@ namespace ToolCallingScratch
                     var funcArgs = toolCall!.ParseArguments();
                     if (toolCall.Name == "getWeather" && funcArgs.ContainsKey("city"))
                     {
-                        Console.ForegroundColor = ConsoleColor.Green;
-                        Console.WriteLine($"SUCCESS: Correct tool-call syntax.");
+                        ColorWriteLine($"`gSUCCESS: Correct tool-call syntax.");
                     }
                     else
                     {
-                        Console.ForegroundColor = ConsoleColor.Yellow;
-                        Console.WriteLine($"PARTIAL: Correct tool-call syntax, but incorrect data.");
+                        ColorWriteLine($"`yPARTIAL: Correct tool-call syntax, but incorrect data.");
+                        exitCode = ExitCode.Partial;
                     }
-                    Console.ResetColor();
-                    return 0;
                 }
-
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"FAIL: Incorrect tool-call syntax.");
-                Console.ResetColor();
-                return 1;
+                else
+                {
+                    ColorWriteLine($"`rFAIL: Incorrect tool-call syntax.");
+                    exitCode = ExitCode.Fail;
+                }
+            }
+            catch (TaskCanceledException)
+            {
+                ColorWriteLine($"`rFAIL: Chat took longer than {chatTimeoutInSeconds} seconds to respond.");
+                exitCode = ExitCode.Timeout;
             }
             catch (Exception ex)
             {
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"FAIL: Runtime error.");
-                Console.WriteLine(ex.ToString());
-                Console.ResetColor();
-                if (model is not null)
-                {
-                    await model.UnloadAsync();
-                }
-                return 2;
+                ColorWriteLine($"`rFAIL: Runtime error.{Environment.NewLine}{GetExceptionMessage(ex)}");
+                exitCode = ExitCode.Exception;
             }
+
+            return exitCode;
+        }
+
+        static async Task<ExitCode> RunAll(ICatalog catalog, bool requireTools)
+        {
+            var results = new List<string>[] { [], [], [], [], [], [] }; // one per exit code. 'badarg' and 'other' shouldn't happen...
+            int count = 0;
+            foreach (var model in await Measure(() => catalog.ListModelsAsync(), "Getting list of models"))
+            {
+                if (!model.Info.SupportsToolCalling.HasValue || model.Info.SupportsToolCalling.Value == false)
+                {
+                    ColorWriteLine($"`cModel {model.Info.Name} doesn't support tool calling; skipping.");
+                    continue;
+                }
+
+                if (model.Info.FileSizeMb > 8_192)
+                {
+                    ColorWriteLine($"`cModel {model.Info.Name} is too large ({model.Info.FileSizeMb:N} MB); skipping.");
+                    continue;
+                }
+
+                count++;
+                results[(int)await RunOne(model, requireTools)].Add(model.Info.Name);
+            }
+
+            ColorWriteLine($"""
+                `w
+                Results
+                =======
+                Success: {string.Join(", ", results[(int)ExitCode.Success])}
+                Partial: {string.Join(", ", results[(int)ExitCode.Partial])}
+                Fail: {string.Join(", ", results[(int)ExitCode.Fail])}
+                Timeout: {string.Join(", ", results[(int)ExitCode.Timeout])}
+                Exception: {string.Join(", ", results[(int)ExitCode.Exception])}
+                Total: {string.Join(", ", count)}
+                """);
+
+            return ExitCode.Success;
+        }
+
+        static void ColorWriteLine(string content) => ColorWrite(content + Environment.NewLine);
+
+        static void ColorWrite(string content)
+        {
+            char color = ' ';
+            // Can begin with "`x" where x is a color.
+            if (content is ['`', char c, .. var rest])
+            {
+                color = c;
+                content = rest;
+            }
+
+            Console.ForegroundColor = color switch
+            {
+                'r' => ConsoleColor.Red,
+                'g' => ConsoleColor.Green,
+                'y' => ConsoleColor.Yellow,
+                'c' => ConsoleColor.Cyan,
+                'd' => ConsoleColor.DarkGray,
+                'w' => ConsoleColor.White,
+                _ => ConsoleColor.Gray
+            };
+
+            Console.Write(content);
+            Console.ResetColor();
+        }
+
+        static void ShowModelInfo(IModel model, bool requireTools)
+        {
+            ColorWriteLine($"""
+                `y{new string('-', 50)}
+                Name: {model.Info.Name} ({model.Info.FileSizeMb:N} MB).
+                EP: {model.Info.Runtime!.ExecutionProvider} running on the {model.Info.Runtime.DeviceType}.
+                """);
+            if (requireTools)
+            {
+                ColorWriteLine($"`yForcing the use of tools.");
+            }
+            Console.ResetColor();
+        }
+
+        // ONNX tends to put A LOT of text into the "Message", which is annoying...
+        // It also doesn't use Environment.Newline, which is annoying.
+        static string GetExceptionMessage(Exception ex)
+        {
+            var message = ex.Message;
+            var newline = Math.Min(message.IndexOf('\r'), message.IndexOf('\n'));
+            if (newline > 0)
+            {
+                message = message[..newline];
+            }
+            if (message.Length > 250)
+            {
+                message = message[..250];
+            }
+
+            return message;
         }
     }
 }
