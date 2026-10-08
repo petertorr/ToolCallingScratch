@@ -35,15 +35,20 @@ namespace ToolCallingScratch
             new FunctionDefinitionBuilder("getWeather", "Returns the weather for a specific city, in degrees celcius.")
             .AddParameter("city", PropertyDefinition.DefineString("The name of the city to get the weather for."), true)
             .Build());
+        
         const int chatTimeoutInSeconds = 60 * 1; // Time to wait for an answer. It's a trivial prompt...
-        const int maxErrorMessageLength = 300; // Truncate error messages longer than this.
-        const int maxFileSizeInMb = 8_192; // Max model size we want to support.
+        const int maxErrorMessageLength = 500; // Truncate error messages longer than this.
+        const int DefaultMaxFileSize = 6 * 1_024; // 6 gigs; reasonable default for machines with 16 GB of RAM.
+
+        static int maxFileSizeInMb = DefaultMaxFileSize; // Max model size we want to support.
+        static bool requireTools = false; // Whether to require tools or not.
 
         static async Task<int> Main(string[] args)
         {
             if (args.Length == 0 ||
                 args[0].Equals("-h", StringComparison.OrdinalIgnoreCase) ||
-                args[0].Equals("--help", StringComparison.OrdinalIgnoreCase))
+                args[0].Equals("--help", StringComparison.OrdinalIgnoreCase) ||
+                args[0].Equals("help", StringComparison.OrdinalIgnoreCase))
             {
                 Usage();
                 return (int)ExitCode.Other;
@@ -53,22 +58,33 @@ namespace ToolCallingScratch
             try
             {
                 string modelName = args[0];
-                bool requireTools = false;
+
                 if (args.Length > 1)
                 {
-                    requireTools = bool.Parse(args[1]);
+                    maxFileSizeInMb = int.Parse(args[1]);
+
+                    if (args.Length > 2)
+                    {
+                        requireTools = bool.Parse(args[2]);
+                    }
                 }
 
                 await TimeActionAsync(() => FoundryLocalManager.CreateAsync(new() { AppName = "ToolCallingScratch" }, NullLogger.Instance), "Creating instance");
                 using var instance = FoundryLocalManager.Instance;
                 var eps = await TimeActionAsync(() => instance.DownloadAndRegisterEpsAsync(), "Registering EPs");
                 var catalog = await TimeActionAsync(() => instance.GetCatalogAsync(), "Getting catalog");
-                WriteLine($"`bArchitecture: {RuntimeInformation.ProcessArchitecture}.");
-                WriteLine($"`bRegistered EPs: {string.Join(", ", eps.RegisteredEps)}.");
+                WriteLine($"""
+                    `wArchitecture: {RuntimeInformation.ProcessArchitecture}.
+                    Registered EPs: {string.Join(", ", eps.RegisteredEps)}.
+                    Max file size: {maxFileSizeInMb:N} MB.;
+                    Forcing tool usage: {requireTools}.;
+                    """);
+                
                 if (eps.FailedEps.Length > 0)
                 {
                     WriteLine($"`rFailed EPs: {string.Join(", ", eps.FailedEps)}.");
                 }
+
                 if (modelName.Equals("list", StringComparison.OrdinalIgnoreCase))
                 {
                     return (int)await ListAllModelsAsync(catalog);
@@ -76,11 +92,11 @@ namespace ToolCallingScratch
 
                 if (modelName.Equals("all", StringComparison.OrdinalIgnoreCase))
                 {
-                    return (int)await RunAllModelsAsync(catalog, requireTools);
+                    return (int)await RunAllModelsAsync(catalog);
                 }
 
                 var model = (await TimeActionAsync(() => catalog.GetModelAsync(modelName), $"Getting model {modelName}"));
-                return (int)await RunOneModelAsync(model, requireTools);
+                return (int)await RunOneModelAsync(model);
             }
             catch (Exception ex)
             {
@@ -97,15 +113,19 @@ namespace ToolCallingScratch
         static void Usage()
         {
             WriteLine($"""
-                `b
-                Usage 1: {Path.GetFileNameWithoutExtension(Environment.ProcessPath)} <modelAlias> [requireTools]
-                            Checks the given model (or all models) for successful tool-calling ability.
+                `w
+                {Path.GetFileNameWithoutExtension(Environment.ProcessPath)} - Checks Foundry Local models for successful tool-calling ability.
 
-                            <modelAlias>    is either an alias (like 'qwen2.5-7b') or the special value 'all' to run all models.
-                            [requireTools]  optional; whether to require the use of tools (default is 'false').
-                    
-                Usage 2: {Path.GetFileNameWithoutExtension(Environment.ProcessPath)} list
-                            Lists all models that "should" support tool-calling, according to their metadata.
+                Usage:
+                   <modelAlias> [maxFileSize [requireTools]]
+                   all [maxFileSize [requireTools]]
+                   list
+
+                   * <modelAlias>  a model alias like 'qwen3-4b'; do not use the full name (like 'qwen3-4b-cuda-gpu').
+                   * maxFileSize   optional; maximum model file size to check, in MB. Default is {DefaultMaxFileSize}.
+                   * requireTools  optional; whether to require the use of tools (default is 'false').
+                   * all           checks all available models.
+                   * list          lists all models that "should" support tool-calling, according to their metadata.
                                         
                 Exit code is 0 for success, > 0 for an error.
                 """);
@@ -123,14 +143,14 @@ namespace ToolCallingScratch
             return result.Acceptable > 0 ? ExitCode.Success : ExitCode.Other;
         }
 
-        static async Task<ExitCode> RunOneModelAsync(IModel? model, bool requireTools)
+        static async Task<ExitCode> RunOneModelAsync(IModel? model)
         {
             if (!IsCandidateModel(model, true))
             {
                 return ExitCode.Other;
             }
 
-            ShowModelInfo(model, requireTools);
+            ShowModelInfo(model);
             try
             {
                 await TimeActionAsync(() => model.DownloadAsync(), "Downloading model");
@@ -151,12 +171,12 @@ namespace ToolCallingScratch
             }
         }
 
-        static async Task<ExitCode> RunAllModelsAsync(ICatalog catalog, bool requireTools)
+        static async Task<ExitCode> RunAllModelsAsync(ICatalog catalog)
         {
             var results = new List<string>[] { [], [], [], [], [], [] }; // one per exit code. 'badarg' and 'other' shouldn't happen...
 
             var totals = await EnumerateAllCandidateModelsAsync(catalog,
-                async model => results[(int)await RunOneModelAsync(model, requireTools)].Add(model.Info.Alias),
+                async model => results[(int)await RunOneModelAsync(model)].Add(model.Info.Alias),
                 true);
 
             WriteLine($"""
@@ -255,7 +275,7 @@ namespace ToolCallingScratch
             {
                 if (showInfo)
                 {
-                    WriteLine($"`cModel {model.Info.Name} doesn't support tool calling; ignoring.");
+                    WriteLine($"`cModel {model.Info.Name} doesn't claim to support tool calling; ignoring.");
                 }
                 return false;
             }
@@ -282,7 +302,7 @@ namespace ToolCallingScratch
             };
         }
 
-        static void ShowModelInfo(IModel model, bool requireTools)
+        static void ShowModelInfo(IModel model)
         {
             Write($"""
                 `y{new string('-', 50)}
@@ -290,12 +310,6 @@ namespace ToolCallingScratch
                 EP: {model.Info.Runtime!.ExecutionProvider}
                 """);
             WriteLine(GetDeviceTypeInColor(model) + ".");
-
-            if (requireTools)
-            {
-                WriteLine($"`oForcing the use of tools.");
-            }
-            Console.ResetColor();
         }
 
         static void WriteLine(string content) => Write(content + Environment.NewLine);
@@ -314,8 +328,9 @@ namespace ToolCallingScratch
             {
                 'r' => ConsoleColor.Red,
                 'g' => ConsoleColor.Green,
-                'n' => ConsoleColor.DarkGreen,
+                'b' => ConsoleColor.Blue,
                 'y' => ConsoleColor.Yellow,
+                'n' => ConsoleColor.DarkGreen,
                 'o' => ConsoleColor.DarkYellow,
                 'm' => ConsoleColor.Magenta,
                 'c' => ConsoleColor.Cyan,
