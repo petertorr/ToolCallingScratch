@@ -15,7 +15,6 @@ namespace ToolCallingScratch
         Fail = 2,
         Timeout = 3,
         Exception = 4,
-        BadArgs = 5,
         Other = 99
     }
 
@@ -70,11 +69,11 @@ namespace ToolCallingScratch
             {
                 if (ex is not IndexOutOfRangeException)
                 {
-                    ColorWriteLine($"`rError: {ex.Message}");
+                    ColorWriteLine($"`r{Environment.NewLine}ERROR: {ex.Message}");
                 }
 
                 ColorWriteLine($"""
-                    `y
+                    `m
                     Usage: {Path.GetFileNameWithoutExtension(Environment.ProcessPath)} <modelAlias> [requireTools]
 
                         <modelAlias>    is either an alias (like 'qwen2.5-7b') or the special value 'all' to run all models.
@@ -89,10 +88,9 @@ namespace ToolCallingScratch
 
         static async Task<ExitCode> RunOne(IModel? model, bool requireTools)
         {
-            if (model is null)
+            if (!IsCandidateModel(model))
             {
-                ColorWriteLine($"`rError: That model doesn't exit");
-                return ExitCode.BadArgs;
+                return ExitCode.Other;
             }
 
             ShowModelInfo(model, requireTools);
@@ -107,7 +105,7 @@ namespace ToolCallingScratch
             }
             catch (Exception ex)
             {
-                ColorWriteLine($"`rCannot load model:{Environment.NewLine}{GetExceptionMessage(ex)}");
+                ColorWriteLine($"`r{Environment.NewLine}ERROR: Cannot load model:{Environment.NewLine}{GetExceptionMessage(ex)}");
                 return ExitCode.Exception;
             }
             finally
@@ -174,38 +172,56 @@ namespace ToolCallingScratch
             return exitCode;
         }
 
+        static bool IsCandidateModel(IModel? model)
+        {
+            if (model is null)
+            {
+                ColorWriteLine($"`oThe model you chose does not exist.");
+                return false;
+            }
+            if (!model.Info.SupportsToolCalling.HasValue || model.Info.SupportsToolCalling.Value == false)
+            {
+                ColorWriteLine($"`cModel {model.Info.Name} doesn't support tool calling; ignoring.");
+                return false;
+            }
+            if (model.Info.FileSizeMb > 8_192)
+            {
+                ColorWriteLine($"`cModel {model.Info.Name} is too large ({model.Info.FileSizeMb:N} MB); ignoring.");
+                return false;
+            }
+
+            return true;
+        }
+
         static async Task<ExitCode> RunAll(ICatalog catalog, bool requireTools)
         {
             var results = new List<string>[] { [], [], [], [], [], [] }; // one per exit code. 'badarg' and 'other' shouldn't happen...
             int count = 0;
+            int ignored = 0;
+
             foreach (var model in await Measure(() => catalog.ListModelsAsync(), "Getting list of models"))
             {
-                if (!model.Info.SupportsToolCalling.HasValue || model.Info.SupportsToolCalling.Value == false)
+                if (!IsCandidateModel(model))
                 {
-                    ColorWriteLine($"`cModel {model.Info.Name} doesn't support tool calling; skipping.");
-                    continue;
-                }
-
-                if (model.Info.FileSizeMb > 8_192)
-                {
-                    ColorWriteLine($"`cModel {model.Info.Name} is too large ({model.Info.FileSizeMb:N} MB); skipping.");
+                    ignored++;
                     continue;
                 }
 
                 count++;
-                results[(int)await RunOne(model, requireTools)].Add(model.Info.Name);
+                results[(int)await RunOne(model, requireTools)].Add(model.Info.Alias);
             }
 
             ColorWriteLine($"""
                 `w
                 Results
                 =======
-                Success: {string.Join(", ", results[(int)ExitCode.Success])}
-                Partial: {string.Join(", ", results[(int)ExitCode.Partial])}
-                Fail: {string.Join(", ", results[(int)ExitCode.Fail])}
-                Timeout: {string.Join(", ", results[(int)ExitCode.Timeout])}
-                Exception: {string.Join(", ", results[(int)ExitCode.Exception])}
-                Total: {string.Join(", ", count)}
+                Success: {results[(int)ExitCode.Success].Count} {string.Join(", ", results[(int)ExitCode.Success])}
+                Partial: {results[(int)ExitCode.Partial].Count} {string.Join(", ", results[(int)ExitCode.Partial])}
+                Fail:    {results[(int)ExitCode.Fail].Count} {string.Join(", ", results[(int)ExitCode.Fail])}
+                Timeout: {results[(int)ExitCode.Timeout].Count} {string.Join(", ", results[(int)ExitCode.Timeout])}
+                Exception: {results[(int)ExitCode.Exception].Count} {string.Join(", ", results[(int)ExitCode.Exception])}
+                Ignored: {ignored}
+                Total: {count + ignored}
                 """);
 
             return ExitCode.Success;
@@ -228,6 +244,8 @@ namespace ToolCallingScratch
                 'r' => ConsoleColor.Red,
                 'g' => ConsoleColor.Green,
                 'y' => ConsoleColor.Yellow,
+                'o' => ConsoleColor.DarkYellow,
+                'm' => ConsoleColor.Magenta,
                 'c' => ConsoleColor.Cyan,
                 'd' => ConsoleColor.DarkGray,
                 'w' => ConsoleColor.White,
@@ -247,13 +265,14 @@ namespace ToolCallingScratch
                 """);
             if (requireTools)
             {
-                ColorWriteLine($"`yForcing the use of tools.");
+                ColorWriteLine($"`oForcing the use of tools.");
             }
             Console.ResetColor();
         }
 
-        // ONNX tends to put A LOT of text into the "Message", which is annoying...
-        // It also doesn't use Environment.Newline, which is annoying.
+        const int maxErrorMessageLength = 300;
+        // ONNX tends to put the entire stack track and / or a lot of context into the "Message".
+        // It also doesn't always use Environment.Newline for newlines.
         static string GetExceptionMessage(Exception ex)
         {
             var message = ex.Message;
@@ -262,9 +281,9 @@ namespace ToolCallingScratch
             {
                 message = message[..newline];
             }
-            if (message.Length > 250)
+            if (message.Length > maxErrorMessageLength)
             {
-                message = message[..250];
+                message = message[..(maxErrorMessageLength - 3)] + "...";
             }
 
             return message;
