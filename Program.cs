@@ -46,7 +46,10 @@ namespace ToolCallingScratch
         static async Task<int> Main(string[] args)
         {
             if (args.Length == 0 ||
+                args[0].Equals("/h", StringComparison.OrdinalIgnoreCase) ||
+                args[0].Equals("/?", StringComparison.OrdinalIgnoreCase) ||
                 args[0].Equals("-h", StringComparison.OrdinalIgnoreCase) ||
+                args[0].Equals("-?", StringComparison.OrdinalIgnoreCase) ||
                 args[0].Equals("--help", StringComparison.OrdinalIgnoreCase) ||
                 args[0].Equals("help", StringComparison.OrdinalIgnoreCase))
             {
@@ -76,8 +79,8 @@ namespace ToolCallingScratch
                 WriteLine($"""
                     `wArchitecture: {RuntimeInformation.ProcessArchitecture}.
                     Registered EPs: {string.Join(", ", eps.RegisteredEps)}.
-                    Max file size: {maxFileSizeInMb:N} MB.;
-                    Forcing tool usage: {requireTools}.;
+                    Max file size: {maxFileSizeInMb:N} MB.
+                    Forcing tool usage: {requireTools}.
                     """);
                 
                 if (eps.FailedEps.Length > 0)
@@ -112,15 +115,18 @@ namespace ToolCallingScratch
 
         static void Usage()
         {
+            var exe = Path.GetFileNameWithoutExtension(Environment.ProcessPath);
+
             WriteLine($"""
                 `w
-                {Path.GetFileNameWithoutExtension(Environment.ProcessPath)} - Checks Foundry Local models for successful tool-calling ability.
+                {exe} - Checks Foundry Local models for successful tool-calling ability.
 
                 Usage:
-                   <modelAlias> [maxFileSize [requireTools]]
-                   all [maxFileSize [requireTools]]
-                   list
+                   1) {exe} <modelAlias> [maxFileSize [requireTools]]
+                   2) {exe} all [maxFileSize [requireTools]]
+                   3) {exe} list
 
+                Arguments:
                    * <modelAlias>  a model alias like 'qwen3-4b'; do not use the full name (like 'qwen3-4b-cuda-gpu').
                    * maxFileSize   optional; maximum model file size to check, in MB. Default is {DefaultMaxFileSize}.
                    * requireTools  optional; whether to require the use of tools (default is 'false').
@@ -156,7 +162,7 @@ namespace ToolCallingScratch
                 await TimeActionAsync(() => model.DownloadAsync(), "Downloading model");
                 await TimeActionAsync(() => model.LoadAsync(), "Loading model");
                 var client = await TimeActionAsync(() => model.GetChatClientAsync(), "Getting chat client");
-                client.Settings.Temperature = 0.001f;
+                client.Settings.Temperature = 0f;
                 client.Settings.ToolChoice = requireTools ? ToolChoice.Required : ToolChoice.Auto;
                 return await ExecutePromptAsync(client);
             }
@@ -183,13 +189,14 @@ namespace ToolCallingScratch
                 `w
                 Results
                 =======
-                  Success ({results[(int)ExitCode.Success].Count,2}): {string.Join(", ", results[(int)ExitCode.Success])}
-                  Partial ({results[(int)ExitCode.Partial].Count,2}): {string.Join(", ", results[(int)ExitCode.Partial])}
-                     Fail ({results[(int)ExitCode.Fail].Count,2}): {string.Join(", ", results[(int)ExitCode.Fail])}
-                  Timeout ({results[(int)ExitCode.Timeout].Count,2}): {string.Join(", ", results[(int)ExitCode.Timeout])}
-                Exception ({results[(int)ExitCode.Exception].Count,2}): {string.Join(", ", results[(int)ExitCode.Exception])}
-                  Ignored  {totals.Ignored}
-                    Total  {totals.Total}
+                  Success: {results[(int)ExitCode.Success].Count,2} {string.Join(", ", results[(int)ExitCode.Success])}
+                  Partial: {results[(int)ExitCode.Partial].Count,2} {string.Join(", ", results[(int)ExitCode.Partial])}
+                     Fail: {results[(int)ExitCode.Fail].Count,2} {string.Join(", ", results[(int)ExitCode.Fail])}
+                  Timeout: {results[(int)ExitCode.Timeout].Count,2} {string.Join(", ", results[(int)ExitCode.Timeout])}
+                Exception: {results[(int)ExitCode.Exception].Count,2} {string.Join(", ", results[(int)ExitCode.Exception])}
+                  Ignored: {totals.Ignored,2}
+                -------------
+                    Total: {totals.Total,2}
                 """);
 
             return ExitCode.Success;
@@ -200,30 +207,38 @@ namespace ToolCallingScratch
             ExitCode exitCode = ExitCode.Fail;
             try
             {
-
                 var response = await TimeActionAsync(() => client.CompleteChatAsync(messages, [toolDefinition], new CancellationTokenSource(TimeSpan.FromSeconds(chatTimeoutInSeconds)).Token), "Sending prompt");
                 var reply = response.Choices[0]!;
+                var message = reply.Message;
+                var content = message.Content!;
 
-                WriteLine($"`aVerbatim response:{Environment.NewLine}---{Environment.NewLine}{reply.Message.Content}{Environment.NewLine}---");
+                WriteLine($"`aVerbatim response:{Environment.NewLine}---{Environment.NewLine}{message.Content}{Environment.NewLine}---");
 
                 if (reply.FinishReason == "tool_calls")
                 {
-                    var toolCall = reply.Message!.ToolCalls![0].FunctionCall;
-                    var funcArgs = toolCall!.ParseArguments();
-                    if (toolCall.Name == "getWeather" && funcArgs.ContainsKey("city"))
+                    var toolCall = message.ToolCalls![0].FunctionCall!;
+                    var funcArgs = toolCall.ParseArguments();
+                    if (toolCall.Name == "getWeather" && funcArgs.TryGetValue("city", out var city) && city.Equals("Seattle"))
                     {
                         WriteLine($"`gSUCCESS: Correct tool-call syntax.");
                         exitCode = ExitCode.Success;
                     }
                     else
                     {
-                        WriteLine($"`yPARTIAL: Correct tool-call syntax, but incorrect data.");
+                        WriteLine($"`oPARTIAL: Correct tool-call syntax, but incorrect data.");
                         exitCode = ExitCode.Partial;
                     }
                 }
+                else if (content.Contains("tool_call")
+                    && content.Contains(toolDefinition.Function!.Name) 
+                    && content.Contains("Seattle"))
+                {
+                    WriteLine($"`oPARTIAL: Deduced tool call was neded, but didn't use the right syntax.");
+                    exitCode = ExitCode.Partial;
+                }
                 else
                 {
-                    WriteLine($"`rFAIL: Incorrect tool-call syntax.");
+                    WriteLine($"`rFAIL: Total failure; no reasonable attempt at calling a tool.");
                     exitCode = ExitCode.Fail;
                 }
             }
@@ -283,7 +298,7 @@ namespace ToolCallingScratch
             {
                 if (showInfo)
                 {
-                    WriteLine($"`cModel {model.Info.Name} is too large ({model.Info.FileSizeMb:N} MB); ignoring.");
+                    WriteLine($"`cModel {model.Info.Name} is too large ({model.Info.FileSizeMb:N0} MB); ignoring.");
                 }
                 return false;
             }
@@ -306,7 +321,7 @@ namespace ToolCallingScratch
         {
             Write($"""
                 `y{new string('-', 50)}
-                Alias: {model.Alias}, Full Name: {model.Info.Name}, Size: {model.Info.FileSizeMb:N} MB.
+                Alias: {model.Alias}, Full Name: {model.Info.Name}, Size: {model.Info.FileSizeMb:N0} MB.
                 EP: {model.Info.Runtime!.ExecutionProvider}
                 """);
             WriteLine(GetDeviceTypeInColor(model) + ".");
