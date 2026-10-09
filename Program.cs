@@ -6,6 +6,8 @@ using Microsoft.Extensions.Logging.Abstractions;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.InteropServices;
+using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace ToolCallingScratch
 {
@@ -28,7 +30,7 @@ namespace ToolCallingScratch
     {
         static readonly List<ChatMessage> messages =
                 [
-                    new("system", "You provide weather forecast information using a tool."),
+                    new("system", "You provide weather forecast information using a tool. Use tools through the structured tool_calls API only. Do not write fake JSON or XML tool calls as text. When a tool is needed, call it via tool_calls instead of saying you will do it."),
                     new("user", "What is the weather in Seattle?")
                 ];
         static readonly ToolDefinition toolDefinition = ToolDefinition.DefineFunction(
@@ -79,6 +81,7 @@ namespace ToolCallingScratch
                 WriteLine($"""
                     `wArchitecture: {RuntimeInformation.ProcessArchitecture}.
                     Registered EPs: {string.Join(", ", eps.RegisteredEps)}.
+                    Testing GPU variants only.
                     Max file size: {maxFileSizeInMb:N} MB.
                     Forcing tool usage: {requireTools}.
                     """);
@@ -119,7 +122,7 @@ namespace ToolCallingScratch
 
             WriteLine($"""
                 `w
-                {exe} - Checks Foundry Local models for successful tool-calling ability.
+                {exe} - Checks Foundry Local GPU models for successful tool-calling ability.
 
                 Usage:
                    1) {exe} <modelAlias> [maxFileSize [requireTools]]
@@ -130,8 +133,8 @@ namespace ToolCallingScratch
                    * <modelAlias>  a model alias like 'qwen3-4b'; do not use the full name (like 'qwen3-4b-cuda-gpu').
                    * maxFileSize   optional; maximum model file size to check, in MB. Default is {DefaultMaxFileSize}.
                    * requireTools  optional; whether to require the use of tools (default is 'false').
-                   * all           checks all available models.
-                   * list          lists all models that "should" support tool-calling, according to their metadata.
+                   * all           checks all eligible GPU variants; skips models without a GPU variant.
+                   * list          lists GPU models that claim to support tool-calling and meet the size limit.
                                         
                 Exit code is 0 for success, > 0 for an error.
                 """);
@@ -214,20 +217,35 @@ namespace ToolCallingScratch
 
                 WriteLine($"`aVerbatim response:{Environment.NewLine}---{Environment.NewLine}{message.Content}{Environment.NewLine}---");
 
-                if (reply.FinishReason == "tool_calls")
+                var fallback = reply.FinishReason == "tool_calls" ? null : TryParseFallbackToolCall(content);
+
+                if (reply.FinishReason == "tool_calls" || fallback.HasValue)
                 {
-                    var toolCall = message.ToolCalls![0].FunctionCall!;
-                    var funcArgs = toolCall.ParseArguments();
-                    if (toolCall.Name == toolDefinition.Function!.Name 
+                    string name;
+                    Dictionary<string, object> funcArgs;
+                    if (fallback.HasValue)
+                    {
+                        name = fallback.Value.Name;
+                        funcArgs = fallback.Value.Arguments;
+                    }
+                    else
+                    {
+                        var toolCall = message.ToolCalls![0].FunctionCall!;
+                        name = toolCall.Name!;
+                        funcArgs = toolCall.ParseArguments();
+                    }
+
+                    var via = fallback.HasValue ? " (fallback-parsed from content, not structured tool_calls)" : "";
+                    if (name == toolDefinition.Function!.Name
                         && funcArgs.TryGetValue("city", out var city) 
                         && city.ToString()!.Equals("Seattle"))
                     {
-                        WriteLine($"`gSUCCESS: Correct tool-call syntax.");
+                        WriteLine($"`gSUCCESS: Correct tool-call syntax{via}.");
                         exitCode = ExitCode.Success;
                     }
                     else
                     {
-                        WriteLine($"`oPARTIAL: Correct tool-call syntax, but incorrect data.");
+                        WriteLine($"`oPARTIAL: Correct tool-call syntax, but incorrect data{via}.");
                         exitCode = ExitCode.Partial;
                     }
                 }
@@ -256,6 +274,62 @@ namespace ToolCallingScratch
             }
 
             return exitCode;
+        }
+
+        // Some models (e.g. qwen2.5-7b QNN NPU) put the call in plain text content instead of tool_calls.
+        // Accepts {"name": ..., "arguments": {...}} (as in foundryperf) or a looser name({...}) form
+        // possibly wrapped in junk like ")(((".
+        static (string Name, Dictionary<string, object> Arguments)? TryParseFallbackToolCall(string? content)
+        {
+            if (string.IsNullOrWhiteSpace(content))
+            {
+                return null;
+            }
+
+            var knownName = toolDefinition.Function!.Name!;
+            var trimmed = content.Trim();
+
+            try
+            {
+                if (trimmed.StartsWith('{') && trimmed.EndsWith('}'))
+                {
+                    using var doc = JsonDocument.Parse(trimmed);
+                    var root = doc.RootElement;
+                    if (root.TryGetProperty("name", out var nameEl)
+                        && nameEl.ValueKind == JsonValueKind.String
+                        && nameEl.GetString() == knownName)
+                    {
+                        var args = root.TryGetProperty("arguments", out var argsEl) ? argsEl : default;
+                        return (knownName, ToArgs(args));
+                    }
+                    return null;
+                }
+
+                var match = Regex.Match(trimmed, Regex.Escape(knownName) + @"\s*\(\s*(\{.*\})\s*\)", RegexOptions.Singleline);
+                if (match.Success)
+                {
+                    using var doc = JsonDocument.Parse(match.Groups[1].Value);
+                    return (knownName, ToArgs(doc.RootElement));
+                }
+            }
+            catch (JsonException)
+            {
+            }
+
+            return null;
+
+            static Dictionary<string, object> ToArgs(JsonElement el)
+            {
+                var d = new Dictionary<string, object>();
+                if (el.ValueKind == JsonValueKind.Object)
+                {
+                    foreach (var p in el.EnumerateObject())
+                    {
+                        d[p.Name] = p.Value.ValueKind == JsonValueKind.String ? p.Value.GetString()! : p.Value.GetRawText();
+                    }
+                }
+                return d;
+            }
         }
 
         static async Task<ModelCounts> EnumerateAllCandidateModelsAsync(ICatalog catalog, Func<IModel, Task> callback, bool showInfo)
@@ -288,6 +362,18 @@ namespace ToolCallingScratch
                 }
                 return false;
             }
+            var gpu = model.Variants.FirstOrDefault(variant =>
+                variant.Info.Runtime?.DeviceType == DeviceType.GPU);
+            if (gpu is null)
+            {
+                if (showInfo)
+                {
+                    WriteLine($"`cModel {model.Alias} has no GPU variant; ignoring.");
+                }
+                return false;
+            }
+            model.SelectVariant(gpu);
+
             if (!model.Info.SupportsToolCalling.HasValue || model.Info.SupportsToolCalling.Value == false)
             {
                 if (showInfo)
