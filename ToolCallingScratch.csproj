@@ -1,14 +1,30 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <TargetFramework>net10.0-windows10.0.22621.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
-  <ItemGroup>
+  <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
+    <TargetFramework>net10.0-windows10.0.22621.0</TargetFramework>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="!$([MSBuild]::IsOSPlatform('Windows'))">
+    <TargetFramework>net10.0</TargetFramework>
+    <RuntimeIdentifiers>osx-arm64;linux-x64;linux-arm64</RuntimeIdentifiers>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('OSX'))">
+    <RuntimeIdentifier>osx-arm64</RuntimeIdentifier>
+  </PropertyGroup>
+
+  <ItemGroup Condition="$([MSBuild]::IsOSPlatform('Windows'))">
     <PackageReference Include="Microsoft.AI.Foundry.Local.WinML" Version="1.2.4" />
+  </ItemGroup>
+
+  <ItemGroup Condition="!$([MSBuild]::IsOSPlatform('Windows'))">
+    <PackageReference Include="Microsoft.AI.Foundry.Local" Version="1.2.4" />
   </ItemGroup>
 
 </Project>
