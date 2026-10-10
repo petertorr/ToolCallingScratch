@@ -435,10 +435,11 @@ namespace ToolCallingScratch
         //    * If there is none, go to next tool.
         //
         // 2) Parse the rest of the string into the following tokens (all other chars are ignored):
-        //    * Quoted String (including the empty string and strings with escaped quotes)
-        //    * Boolean literal
-        //    * Numeric literal (including floats)
-        //    * null literal
+        //    * Identifier (typical C-style identifier, but also allows embedded periods).
+        //    * Quoted String (including the empty string and strings with escaped quotes).
+        //    * Boolean literal.
+        //    * Numeric literal (including floats).
+        //    * null literal.
         //
         // 3) Attempts to match the remaining tokens against the arguments defined by
         //    the tool, in the form of <property-name> followed by <property-value>.
@@ -539,7 +540,7 @@ namespace ToolCallingScratch
                     var propertyValue = targetGroup.Value;
 
                     // For bools and null, convert to lower-case (we match case-insensitive because some models
-                    // insist on using 'True' instead of 'true'... and they might do something similar for null
+                    // insist on using 'True' instead of 'true'... and they might do something similar for null)
                     if (targetGroup.Name is "boolean" or "null")
                     {
                         propertyValue = propertyValue.ToLowerInvariant();
