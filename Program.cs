@@ -39,17 +39,67 @@ namespace ToolCallingScratch
         public int Total => Acceptable + Ignored;
     }
 
+    record class ToolCallingIndividualResult(ToolCallingGrade Grade, TimeSpan TotalTime);
+    class ToolCallingResult(IModel model)
+    {
+        public IModel Model { get; } = model;
+        public List<ToolCallingIndividualResult> Results { get; } = [];
+
+        public AverageToolCallingGrade AverageGrade => (AverageToolCallingGrade)(int)((float)Results.Sum(x => (int)x.Grade) / Results.Count + 0.8f); // +0.8f to nudge grade downwards.
+        public TimeSpan AverageTime => TimeSpan.FromMilliseconds(Results.Sum(x => x.TotalTime.TotalMilliseconds) / Results.Count);
+    }
+
+    record class ModelTest(string UserPrompt, string ExpectedFunctionName, Dictionary<string, string> ExpectedArguments);
+
     internal class Program
     {
-        static readonly List<ChatMessage> messages =
-                [
-                    new("system", "You provide weather forecast information using a tool. If you need to call a tool, use the correct JSON format. Do not just say you will use it."),
-                    new("user", "What is the weather in Seattle?")
-                ];
-        static readonly ToolDefinition toolDefinition = ToolDefinition.DefineFunction(
-            new FunctionDefinitionBuilder("getWeather", "Returns the weather for a specific city, in degrees celcius.")
-            .AddParameter("city", PropertyDefinition.DefineString("The name of the city to get the weather for."), true)
-            .Build());
+        static readonly ChatMessage systemChatMessage = new("system",
+            "You are a helpful assistant that can use tools to answer user queries. If you need to call a tool, use the correct JSON format. Do not just say you will use it.");
+
+        static readonly List<ToolDefinition> toolDefinitions = [
+            ToolDefinition.DefineFunction(
+                new FunctionDefinitionBuilder("getWeather", "Returns the weather for a specific city, in degrees celcius.")
+                .AddParameter("city", PropertyDefinition.DefineString("The name of the city to get the weather for."), true)
+                .Build()
+            ),
+
+            ToolDefinition.DefineFunction(
+                new FunctionDefinitionBuilder("convertCurrency", "Converts an amount of money from one currency to another.")
+                .AddParameter("amount", PropertyDefinition.DefineNumber("The amount of money to convert, in the source currency."), true)
+                .AddParameter("from", PropertyDefinition.DefineString("The currency to convert from."), true)
+                .AddParameter("to", PropertyDefinition.DefineString("The currency to convert to."), true)
+                .Build()
+            ),
+
+            ToolDefinition.DefineFunction(
+                new FunctionDefinitionBuilder("writeFile", "Writes a string to a named file.")
+                .AddParameter("filename", PropertyDefinition.DefineString("The name of the file to write to or delete."), true)
+                .AddParameter("contents", PropertyDefinition.DefineString("The contents to write into the file."), true)
+                .AddParameter("overwrite", PropertyDefinition.DefineBoolean("Whether or not to overwrite an existing file."), true)
+                .Build()
+            ),
+            ];
+
+        static readonly ModelTest WeatherTest = new("What is the weather in Seattle?", "getWeather", new()
+        {
+            ["city"] = "Seattle"
+        });
+
+        static readonly ModelTest CurrencyTest = new("What is 5 USD converted to AUD?", "convertCurrency", new()
+        {
+            ["amount"] = "5",
+            ["from"] = "USD",
+            ["to"] = "AUD"
+        });
+
+        static readonly ModelTest FileWriteTest = new("Write the string 'hello world' into the file named testing.txt. If the file already exists, overwrite it", "writeFile", new()
+        {
+            ["filename"] = "testing.txt",
+            ["contents"] = "hello world",
+            ["overwrite"] = "True" // upper-case 'T' because we're ToString()-ing the JsonElement.
+        });
+
+        static readonly List<ModelTest> AllTests = [WeatherTest, CurrencyTest, FileWriteTest];
 
         const int chatTimeoutInSeconds = 60 * 1; // Time to wait for an answer. It's a trivial prompt...
         const int maxErrorMessageLength = 500; // Truncate error messages longer than this.
@@ -124,7 +174,18 @@ namespace ToolCallingScratch
                 }
 
                 var model = (await TimeActionAsync(() => catalog.GetModelAsync(modelName), $"Getting model {modelName}"));
-                return (int)await RunOneModelAsync(model);
+                if (model is null)
+                {
+                    WriteLine($"`r{modelName} is not a valid model.");
+                    return (int)ExitCode.Other;
+                }
+
+                return (int)((await RunOneModelAsync(model)).AverageGrade switch
+                {
+                    AverageToolCallingGrade.A => ExitCode.Success,
+                    AverageToolCallingGrade.B => ExitCode.Success,
+                    _ => ExitCode.Fail
+                });
             }
             catch (Exception ex)
             {
@@ -147,20 +208,19 @@ namespace ToolCallingScratch
                 {exe} - Checks Foundry Local models for successful tool-calling ability.
 
                 Usage:
-                   1) {exe} <modelAlias> [maxFileSize [requireTools [enableCpu]]]
-                   2) {exe} all [maxFileSize [requireTools [enableCpu]]]
-                   2) {exe} allvariants [maxFileSize [requireTools [enableCpu]]]
-                                
-                   3) {exe} list
+                   1) {exe} <modelAlias> [<maxFileSize> [<requireTools> [<enableCpu>]]]
+                   2) {exe} all [<maxFileSize> [<requireTools> [<enableCpu>]]]
+                   3) {exe} allvariants [<maxFileSize> [<requireTools> [<enableCpu>]]]
+                   4) {exe} list
 
                 Arguments:
-                   * <modelAlias>  a model alias like 'qwen3-4b'; do not use the full name (like 'qwen3-4b-cuda-gpu').
-                   * maxFileSize   optional; maximum model file size to check, in MB. Default is {DefaultMaxFileSize}.
-                   * requireTools  optional; whether to require the use of tools (default is 'false').
-                   * enabeCpu      optional; whether to enable running CPU-based models (s.l.o.w.) (default is 'false').
-                   * all           checks all available models, using the "best" variant for the device.
-                   * allvariants   checks all available models, inculding variants that aren't the "best" for the device.
-                   * list          lists all models that "should" support tool-calling, according to their metadata.
+                   * <modelAlias>    a model alias like 'qwen3-4b'; do not use the full name (like 'qwen3-4b-cuda-gpu').
+                   * <maxFileSize>   optional; maximum model file size to check, in MB. Default is {DefaultMaxFileSize}.
+                   * <requireTools>  optional; whether to require the use of tools (default is 'false').
+                   * <enabeCpu>      optional; whether to enable running CPU-based models (s.l.o.w.) (default is 'false').
+                   * all             checks all available models, using the "best" variant for the device.
+                   * allvariants     checks all available models, inculding variants that aren't the "best" for the device.
+                   * list            lists all models that "should" support tool-calling, according to their metadata.
                                         
                 Exit code is 0 for success, > 0 for an error.
                 """);
@@ -172,7 +232,7 @@ namespace ToolCallingScratch
             WriteLine($"`yLising all applicable models for this device, including variants.{Environment.NewLine}");
             var result = await EnumerateAllCandidateModelsAsync(catalog, true, model =>
             {
-                Write($"`w{model.Alias,30} ");
+                Write($"`w{model.Alias,30}");
                 Write(GetDeviceTypeInColor(model));
                 WriteLine($"`d {model.Info.Runtime!.ExecutionProvider,-25} [{model.Info.Name}]");
                 ++total;
@@ -183,11 +243,13 @@ namespace ToolCallingScratch
             return result.Acceptable > 0 ? ExitCode.Success : ExitCode.Other;
         }
 
-        static async Task<ToolCallingGrade> RunOneModelAsync(IModel? model)
+        static async Task<ToolCallingResult> RunOneModelAsync(IModel model)
         {
+            var combinedResult = new ToolCallingResult(model);
             if (!IsCandidateModel(model, true))
             {
-                return ToolCallingGrade.Ineligible;
+                combinedResult.Results.Add(new(ToolCallingGrade.Ineligible, TimeSpan.FromSeconds(0)));
+                return combinedResult;
             }
 
             ShowModelInfo(model);
@@ -198,17 +260,33 @@ namespace ToolCallingScratch
                 var client = await TimeActionAsync(() => model.GetChatClientAsync(), "Getting chat client");
                 client.Settings.Temperature = 0f;
                 client.Settings.ToolChoice = requireTools ? ToolChoice.Required : ToolChoice.Auto;
-                return await ExecutePromptAsync(client);
+
+                foreach (var test in AllTests)
+                {
+                    var execResult = await TimeActionAsync(() => ExecutePromptAsync(client, test));
+                    combinedResult.Results.Add(new(execResult.Value, execResult.Elapsed));
+                }
             }
             catch (Exception ex)
             {
                 WriteLine($"`r{Environment.NewLine}ERROR: Cannot load model:{Environment.NewLine}{GetExceptionMessage(ex)}");
-                return ToolCallingGrade.F;
+                combinedResult.Results.Add(new(ToolCallingGrade.F, TimeSpan.FromSeconds(0)));
             }
             finally
             {
                 await model.UnloadAsync();
             }
+
+            WriteLine($"""
+                `y
+                
+                Combined Result:
+                ================
+                Average grade: {combinedResult.AverageGrade}
+                Average time:  {combinedResult.AverageTime.TotalMilliseconds:N0}ms
+                """);
+
+            return combinedResult;
         }
 
         static async Task<ExitCode> RunAllModelsAsync(ICatalog catalog, bool includeVariants)
@@ -216,7 +294,7 @@ namespace ToolCallingScratch
             var results = new List<string>[] { [], [], [], [], [], [] }; // one per grade, A-F.
 
             var totals = await EnumerateAllCandidateModelsAsync(catalog, includeVariants,
-                async model => results[(int)await RunOneModelAsync(model)].Add(model.Info.Alias),
+                async model => results[(int)(await RunOneModelAsync(model)).AverageGrade].Add(model.Info.Alias),
                 true);
 
             WriteLine($"""
@@ -239,12 +317,41 @@ namespace ToolCallingScratch
             string GetLine(ToolCallingGrade grade) => $"{results[(int)grade].Count,2} {string.Join(", ", results[(int)grade])}";
         }
 
-        static async Task<ToolCallingGrade> ExecutePromptAsync(OpenAIChatClient client)
+        static bool IsCorrectFunctionCall(FunctionCall call, ModelTest test)
+        {
+            if (call.Name != test.ExpectedFunctionName)
+            {
+                return false;
+            }
+
+            var funcArgs = call.ParseArguments();
+
+            if (funcArgs.Count < test.ExpectedArguments.Count)
+            {
+                return false;
+            }
+
+            foreach (var arg in test.ExpectedArguments)
+            {
+                if (!funcArgs.TryGetValue(arg.Key, out var value)
+                    || !Equals(arg.Value.ToString(), value.ToString()))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        static async Task<ToolCallingGrade> ExecutePromptAsync(OpenAIChatClient client, ModelTest test)
         {
             ToolCallingGrade exitCode = ToolCallingGrade.F;
+            List<ChatMessage> messages = [systemChatMessage];
+            messages.Add(new("user", test.UserPrompt));
+
             try
             {
-                var response = await TimeActionAsync(() => client.CompleteChatAsync(messages, [toolDefinition], new CancellationTokenSource(TimeSpan.FromSeconds(chatTimeoutInSeconds)).Token), "Sending prompt");
+                var response = await TimeActionAsync(() => client.CompleteChatAsync(messages, toolDefinitions, new CancellationTokenSource(TimeSpan.FromSeconds(chatTimeoutInSeconds)).Token), $"Sending prompt '{test.UserPrompt}'");
                 var reply = response.Choices[0]!;
                 var message = reply.Message;
                 var content = message.Content!;
@@ -253,33 +360,27 @@ namespace ToolCallingScratch
 
                 if (reply.FinishReason == "tool_calls")
                 {
-                    var toolCall = message.ToolCalls![0].FunctionCall!;
-                    var funcArgs = toolCall.ParseArguments();
-                    if (toolCall.Name == toolDefinition.Function!.Name
-                        && funcArgs.TryGetValue("city", out var city)
-                        && city.ToString()!.Equals("Seattle"))
+                    if (IsCorrectFunctionCall(reply.Message.ToolCalls![0].FunctionCall!, test))
                     {
-                        WriteLine($"`gGRADE A: Correct tool-call syntax.");
+                        WriteLine($"`gGRADE: A. Correct tool-call syntax with correct data.");
                         exitCode = ToolCallingGrade.A;
                     }
                     else
                     {
-                        WriteLine($"`rGRADE E: Correct tool-call syntax, but incorrect data.");
+                        WriteLine($"`rGRADE: E. Correct tool-call syntax, but incorrect data.");
                         exitCode = ToolCallingGrade.E;
                     }
                 }
                 // Try to brute-force it
-                else if (TryBruteForceFunctionCall(message.Content!, [toolDefinition], out var toolCall)
-                    && toolCall.Name == toolDefinition.Function!.Name
-                    && toolCall.ParseArguments().TryGetValue("city", out var city)
-                    && city.ToString()!.Equals("Seattle"))
+                else if (TryBruteForceFunctionCall(message.Content!, toolDefinitions, out var toolCall)
+                    && IsCorrectFunctionCall(toolCall, test))
                 {
-                    WriteLine($"`oGRADE B: Incorrect tool-call syntax, but it was brute-forced.");
+                    WriteLine($"`oGRADE: B. Incorrect tool-call syntax, but it was brute-forced.");
                     exitCode = ToolCallingGrade.B;
                 }
                 else
                 {
-                    WriteLine($"`rGRADE F: Total failure; no detectable attempt at calling a tool.");
+                    WriteLine($"`rGRADE: F. No detected attempt at calling a tool with the correct name / arguments.");
                     exitCode = ToolCallingGrade.F;
                 }
             }
@@ -351,13 +452,24 @@ namespace ToolCallingScratch
                 var arguments = new Dictionary<string, string>();
 
                 var quotedFunctionName = $@"""{functionName}""";
+                int foundLength;
                 int index = rawMessageContent.LastIndexOf(quotedFunctionName);
-                if (index < 0)
+                if (index >= 0)
                 {
-                    continue;
+                    foundLength = quotedFunctionName.Length;
+                }
+                else
+                {
+                    // Look for unquoted name, like a C-style function call
+                    index = rawMessageContent.LastIndexOf(functionName);
+                    if (index < 0)
+                    {
+                        continue;
+                    }
+                    foundLength = functionName.Length;
                 }
 
-                int offset = index + quotedFunctionName.Length;
+                int offset = index + foundLength;
                 while (offset < rawMessageContent.Length && arguments.Count < parameters.Count)
                 {
                     // Search for the next token
@@ -528,9 +640,9 @@ namespace ToolCallingScratch
         {
             return model.Info.Runtime!.DeviceType switch
             {
-                DeviceType.GPU => "`g(GPU)",
-                DeviceType.NPU => "`m(NPU)",
-                DeviceType.CPU => "`d(CPU)",
+                DeviceType.GPU => "`g (GPU)",
+                DeviceType.NPU => "`m (NPU)",
+                DeviceType.CPU => "`d (CPU)",
                 _ => "`r (Invalid)"
             };
         }
@@ -540,9 +652,9 @@ namespace ToolCallingScratch
             Write($"""
                 `y{new string('-', 50)}
                 Alias: {model.Alias}, Full Name: {model.Info.Name}, Size: {model.Info.FileSizeMb:N0} MB.
-                EP: {model.Info.Runtime!.ExecutionProvider}
+                EP: {model.Info.Runtime!.ExecutionProvider} 
                 """);
-            WriteLine($" {GetDeviceTypeInColor(model)}.");
+            WriteLine($"{GetDeviceTypeInColor(model)}.");
         }
 
         static void WriteLine(string content) => Write(content + Environment.NewLine);
@@ -608,6 +720,14 @@ namespace ToolCallingScratch
             sw.Stop();
             WriteLine($"`d it took {sw.ElapsedMilliseconds:N0} ms");
             return t;
+        }
+
+        static async Task<(T Value, TimeSpan Elapsed)> TimeActionAsync<T>(Func<Task<T>> f)
+        {
+            var sw = Stopwatch.StartNew();
+            var t = await f();
+            sw.Stop();
+            return (t, sw.Elapsed);
         }
     }
 }

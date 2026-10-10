@@ -10,7 +10,9 @@
     },
     "all variants": {
       "commandName": "Project",
-      "commandLineArgs": "allvariants"
+      "commandLineArgs": "allvariants",
+      "hotReloadEnabled": true,
+      "debugEngines": "managed,native"
     }
   }
 }
