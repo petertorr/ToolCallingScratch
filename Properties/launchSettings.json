@@ -2,7 +2,7 @@
   "profiles": {
     "ToolCallingScratch": {
       "commandName": "Project",
-      "commandLineArgs": "qwen2.5-0.5b"
+      "commandLineArgs": "qwen3-1.7b"
     },
     "all": {
       "commandName": "Project",

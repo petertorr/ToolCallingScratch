@@ -398,6 +398,13 @@ namespace ToolCallingScratch
             return exitCode;
         }
 
+        // Letter or underscore, followed by any number of letters, underscores, digits, or periods
+        // (Normal identifiers don't allow periods, but for tools people may like to use "noun.verb"
+        // so it is allowed here
+        const string identifierRegEx = """
+            [a-zA-Z_](?:[a-zA-Z_0-9\.])*
+            """;
+
         // A quote, followed by zero or more non-quote chars OR escaped quotes (with no embedded newlines).
         const string quotedStringRegEx = """
             "(?:[^"\r\n]|(?:\"))*?"
@@ -417,11 +424,9 @@ namespace ToolCallingScratch
             null
             """;
 
-        const string allTokensRegEx = $"""
-            (?<string>{quotedStringRegEx})|(?<number>{numberRegEx})|(?<boolean>{boolRegEx})|(?<null>{nullRegEx})
-            """;
+        static readonly Regex propertyNameRegex = new($"(?<identifier>{identifierRegEx})|(?<string>{quotedStringRegEx})", RegexOptions.Multiline);
 
-        static readonly Regex tokens = new(allTokensRegEx, RegexOptions.Multiline);
+        static readonly Regex propertyValueRegex = new($"(?<string>{quotedStringRegEx})|(?<number>{numberRegEx})|(?<boolean>{boolRegEx})|(?<null>{nullRegEx})", RegexOptions.IgnoreCase);
 
         // Tries to brute-force a function call from message content. For each ToolDefinition in 'tools',
         // it does the following:
@@ -472,40 +477,47 @@ namespace ToolCallingScratch
                 int offset = index + foundLength;
                 while (offset < rawMessageContent.Length && arguments.Count < parameters.Count)
                 {
-                    // Search for the next token
-                    var match = tokens.Match(rawMessageContent, offset);
+                    // Search for the next property name
+                    var match = propertyNameRegex.Match(rawMessageContent, offset);
                     offset = match.Index + match.Length;
                     if (!match.Success)
                     {
-                        // No tokens, can't be a call. And since we already matched the tool name,
-                        // there's no point looking for others.
-                        return false;
+                        // No tokens; can't be a call.
+                        break;
                     }
 
-                    // If the next item isn't a 'string', it's not a property name
-                    var quotedPropertyName = match.Groups["string"].Value;
-                    if (string.IsNullOrEmpty(quotedPropertyName))
+                    string propertyName;
+                    // If it was an identifier, use it as-is, otherwise strip the quotes
+                    if (match.Groups["identifier"].Captures.Count > 0)
                     {
-                        // It wasn't a property name, but we don't bail completely because it could
-                        // just be noise and there may be legit args to come.
-                        continue;
+                        propertyName = match.Value;
+                    }
+                    else
+                    {
+                        propertyName = match.Value[1..^1];
+                    }
+
+                    if (string.IsNullOrEmpty(propertyName))
+                    {
+                        // It was an empty string; can't be a call.
+                        break;
                     }
 
                     // Does it match a known parameter?
-                    var propertyName = quotedPropertyName[1..^1];
                     if (!parameters.TryGetValue(propertyName, out var propertyDefinition))
                     {
                         // Probably "arguments" or another ignorable string.
+                        // Keep looking.
                         continue;
                     }
 
                     // Now look for the property value
-                    match = tokens.Match(rawMessageContent, offset);
+                    match = propertyValueRegex.Match(rawMessageContent, offset);
                     offset = match.Index + match.Length;
                     if (!match.Success)
                     {
                         // No property value; can't be a legit call
-                        return false;
+                        break;
                     }
 
                     // Check if we captured anything of the right group (string, number, etc).
@@ -521,17 +533,26 @@ namespace ToolCallingScratch
                     if (targetGroup.Captures.Count == 0)
                     {
                         // Wasn't the correct type; bail
-                        return false;
+                        break;
                     }
 
-                    arguments.Add(quotedPropertyName, targetGroup.Value);
+                    var propertyValue = targetGroup.Value;
+
+                    // For bools and null, convert to lower-case (we match case-insensitive because some models
+                    // insist on using 'True' instead of 'true'... and they might do something similar for null
+                    if (targetGroup.Name is "boolean" or "null")
+                    {
+                        propertyValue = propertyValue.ToLowerInvariant();
+                    }
+
+                    arguments.Add($@"""{propertyName}""", propertyValue);
                 }
 
                 if (arguments.Count != parameters.Count)
                 {
-                    // Not enough args; bail
+                    // Not enough args; try the next tool
                     // Note this assumes all args are required (could be relaxed)
-                    return false;
+                    continue;
                 }
 
                 // If we got here, the call was a success
@@ -546,7 +567,7 @@ namespace ToolCallingScratch
                 return true;
             }
 
-            // Didn't even find a function name.
+            // Didn't find anything that matched.
             return false;
         }
 
