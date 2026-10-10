@@ -2,7 +2,15 @@
   "profiles": {
     "ToolCallingScratch": {
       "commandName": "Project",
-      "commandLineArgs": "qwen3-vl-2b-instruct"
+      "commandLineArgs": "qwen2.5-0.5b"
+    },
+    "all": {
+      "commandName": "Project",
+      "commandLineArgs": "all"
+    },
+    "all variants": {
+      "commandName": "Project",
+      "commandLineArgs": "allvariants"
     }
   }
 }
