@@ -31,7 +31,8 @@ namespace ToolCallingScratch
 
     enum AverageToolCallingGrade
     {
-        A, B, C, D, E, F
+        A, B, C, D, E, F,
+        Ineligible = 99
     }
 
     record class ModelCounts(int Acceptable, int Ignored)
@@ -39,17 +40,93 @@ namespace ToolCallingScratch
         public int Total => Acceptable + Ignored;
     }
 
-    record class ToolCallingIndividualResult(ToolCallingGrade Grade, TimeSpan TotalTime);
-    class ToolCallingResult(IModel model)
+    record class ToolCallingIndividualTestResult(ToolCallingGrade Grade, TimeSpan TotalTime);
+    class ToolCallingResult(ModelFilterResult filterResult)
     {
-        public IModel Model { get; } = model;
-        public List<ToolCallingIndividualResult> Results { get; } = [];
-
-        public AverageToolCallingGrade AverageGrade => (AverageToolCallingGrade)(int)((float)Results.Sum(x => (int)x.Grade) / Results.Count + 0.8f); // +0.8f to nudge grade downwards.
-        public TimeSpan AverageTime => TimeSpan.FromMilliseconds(Results.Sum(x => x.TotalTime.TotalMilliseconds) / Results.Count);
+        public ModelFilterResult FilterResult { get; } = filterResult;
+        public List<ToolCallingIndividualTestResult> TestResults { get; } = [];
+        public List<ToolCallingIndividualTestResult> EligibleTestResults => TestResults.Where(x => x.Grade != ToolCallingGrade.Ineligible).ToList();
+        public AverageToolCallingGrade AverageGrade => (AverageToolCallingGrade)(int)((float)TestResults.Sum(x => (int)x.Grade) / TestResults.Count + 0.8f); // +0.8f to nudge grade downwards.
+        public TimeSpan AverageTime => TimeSpan.FromMilliseconds(TestResults.Sum(x => x.TotalTime.TotalMilliseconds) / TestResults.Count);
     }
 
     record class ModelTest(string UserPrompt, string ExpectedFunctionName, Dictionary<string, string> ExpectedArguments);
+
+    enum ModelMatchKind
+    {
+        Matched,
+        DidntMatch,
+        NotRequested // either explicitly ignored or not the asked-for model.
+    }
+
+    record class ModelFilterResult(string Name, IModel Model, ModelMatchKind MatchKind, string? ReasonForOmission);
+
+    record class ModelFilter(string? Alias, int MaxSizeInMb, List<string> IgnoredModels, bool TryAllVariants, List<string> RegisteredEps, bool AllowCpu)
+    {
+        internal static ModelFilter Default { get; } = new(null, int.MaxValue, [], false, [], false);
+
+        internal List<ModelFilterResult> GetAllMatches(IEnumerable<IModel> models)
+        {
+            List<ModelFilterResult> results = [];
+            var optionsNoVariants = this with { TryAllVariants = false };
+
+            foreach (var model in models)
+            {
+                if (TryAllVariants)
+                {
+                    foreach (var variant in model.Variants)
+                    {
+                        results.AddRange(optionsNoVariants.GetAllMatches([variant]));
+                    }
+                }
+                else
+                {
+                    var matchKind = GetMatchResult(model, out var reason);
+                    results.Add(new(model.Info.Name, model, matchKind, reason));
+                }
+            }
+
+            return results;
+        }
+
+        internal ModelMatchKind GetMatchResult([NotNullWhen(true)] IModel model, [NotNullWhen(false)] out string? reasonForOmission)
+        {
+            reasonForOmission = null;
+            if (Alias is not null && !model.Alias.Contains(Alias, StringComparison.OrdinalIgnoreCase))
+            {
+                reasonForOmission = $"Model {model.Info.Alias} doesn't match the requested alias.";
+                return ModelMatchKind.NotRequested;
+            }
+            if (IgnoredModels.Contains(model.Alias, StringComparer.OrdinalIgnoreCase) ||
+                IgnoredModels.Contains(model.Info.Name, StringComparer.OrdinalIgnoreCase))
+            {
+                reasonForOmission = $"Model {model.Info.Name} is explicitly ignored.";
+                return ModelMatchKind.NotRequested;
+            }
+            if (!model.Info.SupportsToolCalling.HasValue || model.Info.SupportsToolCalling.Value == false)
+            {
+                reasonForOmission = $"Model {model.Info.Name} doesn't support tool-calling.";
+                return ModelMatchKind.DidntMatch;
+            }
+            if (model.Info.FileSizeMb > MaxSizeInMb)
+            {
+                reasonForOmission = $"Model {model.Info.Name} is too large ({model.Info.FileSizeMb:N0} MB).";
+                return ModelMatchKind.DidntMatch;
+            }
+            if (model.Info.Runtime!.DeviceType is DeviceType.CPU && !AllowCpu)
+            {
+                reasonForOmission = $"Model {model.Info.Name} only runs on the CPU.";
+                return ModelMatchKind.DidntMatch;
+            }
+            if (RegisteredEps.Count > 0 && !RegisteredEps.Contains(model.Info.Runtime!.ExecutionProvider))
+            {
+                reasonForOmission = $"Model {model.Info.Name} is not supported by any registered EP.";
+                return ModelMatchKind.DidntMatch;
+            }
+
+            return ModelMatchKind.Matched;
+        }
+    }
 
     internal class Program
     {
@@ -101,96 +178,167 @@ namespace ToolCallingScratch
 
         static readonly List<ModelTest> AllTests = [WeatherTest, CurrencyTest, FileWriteTest];
 
-        const int chatTimeoutInSeconds = 60 * 1; // Time to wait for an answer. It's a trivial prompt...
         const int maxErrorMessageLength = 500; // Truncate error messages longer than this.
-        const int DefaultMaxFileSize = 6 * 1_024; // 6 gigs; reasonable default for machines with 16 GB of RAM.
 
-        static int maxFileSizeInMb = DefaultMaxFileSize; // Max model size we want to support.
-        static bool requireTools = false; // Whether to require tools or not.
-        static bool allowCpu = false; // Whether to attempt CPU-based execution (could be VERY slow).
+        enum ProgramAction
+        {
+            List,
+            Run,
+            Help
+        }
 
-        static string[] registeredEps = [];
+        record class Options(string ExeName, ProgramAction Action, ModelFilter Filter, bool ForceToolUse, int TimeoutInSeconds)
+        {
+            internal const int DefaultTimeoutInSeconds = 60 * 1; // Time to wait for an answer. It's a trivial prompt...
+            internal const int DefaultMaxFileSize = 6 * 1_024; // 6 gigs; reasonable default for machines with 16 GB of RAM.
+
+            internal static Options Parse(string[] args, out List<string> ignoredArgs)
+            {
+                int index = 0;
+                ignoredArgs = [];
+                List<string> localIgnoredArgs = [];
+                var exe = Path.GetFileNameWithoutExtension(Environment.ProcessPath)!;
+                bool allowCpu = false;
+                bool forceToolUse = false;
+                bool tryAllVariants = false;
+                int timeout = DefaultTimeoutInSeconds;
+                string? alias = null;
+                int maxSize = DefaultMaxFileSize;
+                List<string> ignoredModels = [];
+                List<string> registeredEps = []; // will be filled out after loading.
+                ProgramAction action = ProgramAction.Help;
+
+                if (args.Length == 0)
+                {
+                    return new(exe, action, ModelFilter.Default, forceToolUse, timeout);
+                }
+
+                if (args[0].Equals("list", StringComparison.OrdinalIgnoreCase))
+                {
+                    action = ProgramAction.List;
+                }
+                else if (args[0].Equals("run", StringComparison.OrdinalIgnoreCase))
+                {
+                    action = ProgramAction.Run;
+                }
+                else
+                {
+                    localIgnoredArgs.AddRange(args[1..]);
+                    return new(exe, action, ModelFilter.Default, forceToolUse, timeout);
+                }
+
+                // Start at 1, not 0, since we got the action from args[0]
+                for (index = 1; index < args.Length; ++index)
+                {
+                    switch (args[index].ToLowerInvariant())
+                    {
+                        case "-v":
+                            tryAllVariants = true;
+                            break;
+
+                        case "-c":
+                            allowCpu = true;
+                            break;
+
+                        case "-f":
+                            forceToolUse = true;
+                            break;
+
+                        case "-t":
+                            ParseArgParam("-t", s => timeout = int.Parse(s), "a time in seconds");
+                            break;
+
+                        case "-a":
+                            ParseArgParam("-a", s => alias = s, "a model alias");
+                            break;
+
+                        case "-m":
+                            ParseArgParam("-t", s => maxSize = int.Parse(s), "a file size in MB");
+                            break;
+
+                        case "-i":
+                            ignoredModels.Add(args[index]);
+                            break;
+
+                        default:
+                            WriteLine($"`r{args[index]} option not recognized.");
+                            localIgnoredArgs.Add(args[index]);
+                            break;
+                    }
+                }
+
+                ignoredArgs = localIgnoredArgs;
+                return new(exe, action, new(alias, maxSize, ignoredModels, tryAllVariants, registeredEps, allowCpu), forceToolUse, timeout);
+
+                void ParseArgParam(string param, Action<string> callback, string description)
+                {
+                    if (index < args.Length - 1)
+                    {
+                        ++index;
+                        callback(args[index]);
+                    }
+                    else
+                    {
+                        WriteLine($"`r-{param} option needs {description}.");
+                        localIgnoredArgs.Add(args[index]);
+                    }
+                }
+            }
+        }
 
         static async Task<int> Main(string[] args)
         {
-            if (args.Length == 0 ||
-                args[0].Equals("/h", StringComparison.OrdinalIgnoreCase) ||
-                args[0].Equals("/?", StringComparison.OrdinalIgnoreCase) ||
-                args[0].Equals("-h", StringComparison.OrdinalIgnoreCase) ||
-                args[0].Equals("-?", StringComparison.OrdinalIgnoreCase) ||
-                args[0].Equals("--help", StringComparison.OrdinalIgnoreCase) ||
-                args[0].Equals("help", StringComparison.OrdinalIgnoreCase))
+            var options = Options.Parse(args, out var ignoredArgs);
+            if (ignoredArgs.Count > 0)
             {
-                Usage();
+                WriteLine($"`oIgnoring unknown arguments {string.Join(", ", ignoredArgs)}");
+            }
+
+            if (options.Action == ProgramAction.Help)
+            {
+                Usage(options.ExeName);
                 return (int)ExitCode.Other;
             }
 
             var sw = Stopwatch.StartNew();
             try
             {
-                string modelName = args[0];
-
-                if (args.Length > 1)
-                {
-                    maxFileSizeInMb = int.Parse(args[1]);
-
-                    if (args.Length > 2)
-                    {
-                        requireTools = bool.Parse(args[2]);
-                        if (args.Length > 3)
-                        {
-                            allowCpu = bool.Parse(args[3]);
-                        }
-                    }
-                }
-
-                await TimeActionAsync(() => FoundryLocalManager.CreateAsync(new() { AppName = "ToolCallingScratch" }, NullLogger.Instance), "Creating instance");
+                await TimeActionAsync(() => FoundryLocalManager.CreateAsync(new() { AppName = "ToolCallingScratch" }, NullLogger.Instance), "Creating FoundryLocal instance");
                 using var instance = FoundryLocalManager.Instance;
                 var eps = await TimeActionAsync(() => instance.DownloadAndRegisterEpsAsync(), "Registering EPs");
-                registeredEps = eps.RegisteredEps;
-                var catalog = await TimeActionAsync(() => instance.GetCatalogAsync(), "Getting catalog");
+                options.Filter!.RegisteredEps.AddRange(eps.RegisteredEps);
+                var catalog = await TimeActionAsync(() => instance.GetCatalogAsync(), "Getting model catalog");
                 WriteLine($"""
                     `wArchitecture: {RuntimeInformation.ProcessArchitecture}.
                     Registered EPs: {string.Join(", ", eps.RegisteredEps)}.
-                    Max file size: {maxFileSizeInMb:N} MB.
-                    Forcing tool usage: {requireTools}.
+                    Chosen model(s): {(options.Filter.Alias is not null ? options.Filter.Alias : "all")}{(options.Filter.TryAllVariants ? " (with variants)" : "")}.
+                    Timeout (seconds): {options.TimeoutInSeconds}.
+                    Forcing tool usage: {options.ForceToolUse}.
+                    Max model size: {options.Filter.MaxSizeInMb}.
                     """);
-
+                if (options.Filter.IgnoredModels.Count > 0)
+                {
+                    WriteLine($"`yIgnoring model(s): {string.Join(", ", options.Filter.IgnoredModels)}.");
+                }
                 if (eps.FailedEps.Length > 0)
                 {
                     WriteLine($"`rFailed EPs: {string.Join(", ", eps.FailedEps)}.");
                 }
-                if (modelName.Equals("list", StringComparison.OrdinalIgnoreCase))
+                if (options.Action == ProgramAction.List)
                 {
-                    return (int)await ListAllModelsAsync(catalog);
+                    return (int)await ListAsync(options, catalog);
                 }
-                if (modelName.Equals("all", StringComparison.OrdinalIgnoreCase))
+                if (options.Action == ProgramAction.Run)
                 {
-                    return (int)await RunAllModelsAsync(catalog, false);
-                }
-                if (modelName.Equals("allvariants", StringComparison.OrdinalIgnoreCase))
-                {
-                    return (int)await RunAllModelsAsync(catalog, true);
+                    return (int)await RunAsync(options, catalog);
                 }
 
-                var model = (await TimeActionAsync(() => catalog.GetModelAsync(modelName), $"Getting model {modelName}"));
-                if (model is null)
-                {
-                    WriteLine($"`r{modelName} is not a valid model.");
-                    return (int)ExitCode.Other;
-                }
-
-                return (int)((await RunOneModelAsync(model)).AverageGrade switch
-                {
-                    AverageToolCallingGrade.A => ExitCode.Success,
-                    AverageToolCallingGrade.B => ExitCode.Success,
-                    _ => ExitCode.Fail
-                });
+                throw (new NotImplementedException("Don't know what to do"));
             }
             catch (Exception ex)
             {
                 WriteLine($"`r{Environment.NewLine}ERROR: {ex.Message}");
-                Usage();
+                Usage(options.ExeName);
                 return (int)ExitCode.Other;
             }
             finally
@@ -199,59 +347,66 @@ namespace ToolCallingScratch
             }
         }
 
-        static void Usage()
+        static void Usage(string exe)
         {
-            var exe = Path.GetFileNameWithoutExtension(Environment.ProcessPath);
-
             WriteLine($"""
                 `w
                 {exe} - Checks Foundry Local models for successful tool-calling ability.
 
                 Usage:
-                   1) {exe} <modelAlias> [<maxFileSize> [<requireTools> [<enableCpu>]]]
-                   2) {exe} all [<maxFileSize> [<requireTools> [<enableCpu>]]]
-                   3) {exe} allvariants [<maxFileSize> [<requireTools> [<enableCpu>]]]
-                   4) {exe} list
+                   1) {exe} list [options]  - lists models that match given filters.
+                   2) {exe} run [options]   - runs test for models that match the given filters.
+                   3) {exe} help            - this text.
 
-                Arguments:
-                   * <modelAlias>    a model alias like 'qwen3-4b'; do not use the full name (like 'qwen3-4b-cuda-gpu').
-                   * <maxFileSize>   optional; maximum model file size to check, in MB. Default is {DefaultMaxFileSize}.
-                   * <requireTools>  optional; whether to require the use of tools (default is 'false').
-                   * <enabeCpu>      optional; whether to enable running CPU-based models (s.l.o.w.) (default is 'false').
-                   * all             checks all available models, using the "best" variant for the device.
-                   * allvariants     checks all available models, inculding variants that aren't the "best" for the device.
-                   * list            lists all models that "should" support tool-calling, according to their metadata.
+                Options:
+                   -a <alias>     A model alias like 'qwen3-4b' to select (partial match). By default, all models are selected.
+                   -m <fileSize>  Maximum model file size allowed, in MB. Default is {Options.DefaultMaxFileSize}.
+                   -i <model>     Name or alias of a model to ignore. Can be specified multiple times.
+                   -t <time>      Time, in seconds, to wait for the model to respond. Default is {Options.DefaultTimeoutInSeconds}.
+                   -f             Force tool calling (vs. leaving it as "auto").
+                   -c             Enable CPU-based models, if applicable for your hardware.
+                   -v             Include all variants for the selected model(s).
                                         
                 Exit code is 0 for success, > 0 for an error.
                 """);
         }
 
-        static async Task<ExitCode> ListAllModelsAsync(ICatalog catalog)
+        static async Task<ExitCode> ListAsync(Options options, ICatalog catalog)
         {
             int total = 0;
-            WriteLine($"`yLising all applicable models for this device, including variants.{Environment.NewLine}");
-            var result = await EnumerateAllCandidateModelsAsync(catalog, true, model =>
+            WriteLine($"`yListing models for this device that match your criteria.{Environment.NewLine}");
+            await EnumerateAllCandidateModelsAsync(options, catalog, filteredResult =>
             {
-                Write($"`w{model.Alias,30}");
-                Write(GetDeviceTypeInColor(model));
-                WriteLine($"`d {model.Info.Runtime!.ExecutionProvider,-25} [{model.Info.Name}]");
-                ++total;
+                if (filteredResult.MatchKind == ModelMatchKind.Matched)
+                {
+                    var model = filteredResult.Model;
+                    Write($"`w{filteredResult.Model.Alias,30}");
+                    Write(GetDeviceTypeInColor(model));
+                    WriteLine($"`d {model.Info.Runtime!.ExecutionProvider,-25} [{model.Info.Name}]");
+                    ++total;
+                }
+
                 return Task.CompletedTask;
-            }, false);
+            });
 
             WriteLine($"`y{$"Total models: {total}",30}");
-            return result.Acceptable > 0 ? ExitCode.Success : ExitCode.Other;
+            return total > 0 ? ExitCode.Success : ExitCode.Fail;
         }
 
-        static async Task<ToolCallingResult> RunOneModelAsync(IModel model)
+        static async Task<ToolCallingResult> RunOneModelVariantAsync(Options options, ModelFilterResult filterResult)
         {
-            var combinedResult = new ToolCallingResult(model);
-            if (!IsCandidateModel(model, true))
+            var combinedResult = new ToolCallingResult(filterResult);
+            if (filterResult.MatchKind != ModelMatchKind.Matched)
             {
-                combinedResult.Results.Add(new(ToolCallingGrade.Ineligible, TimeSpan.FromSeconds(0)));
+                if (filterResult.MatchKind == ModelMatchKind.DidntMatch)
+                {
+                    WriteLine($"`cIgnoring {filterResult.Name}: {filterResult.ReasonForOmission}");
+                }
+                combinedResult.TestResults.Add(new(ToolCallingGrade.Ineligible, TimeSpan.FromSeconds(0)));
                 return combinedResult;
             }
 
+            var model = filterResult.Model;
             ShowModelInfo(model);
             try
             {
@@ -259,18 +414,18 @@ namespace ToolCallingScratch
                 await TimeActionAsync(() => model.LoadAsync(), "Loading model");
                 var client = await TimeActionAsync(() => model.GetChatClientAsync(), "Getting chat client");
                 client.Settings.Temperature = 0f;
-                client.Settings.ToolChoice = requireTools ? ToolChoice.Required : ToolChoice.Auto;
+                client.Settings.ToolChoice = options.ForceToolUse ? ToolChoice.Required : ToolChoice.Auto;
 
                 foreach (var test in AllTests)
                 {
-                    var execResult = await TimeActionAsync(() => ExecutePromptAsync(client, test));
-                    combinedResult.Results.Add(new(execResult.Value, execResult.Elapsed));
+                    var execResult = await TimeActionAsync(() => ExecutePromptAsync(options, client, test));
+                    combinedResult.TestResults.Add(new(execResult.Value, execResult.Elapsed));
                 }
             }
             catch (Exception ex)
             {
-                WriteLine($"`r{Environment.NewLine}ERROR: Cannot load model:{Environment.NewLine}{GetExceptionMessage(ex)}");
-                combinedResult.Results.Add(new(ToolCallingGrade.F, TimeSpan.FromSeconds(0)));
+                WriteLine($"`r{Environment.NewLine}ERROR: Cannot load model {filterResult.Name}:{Environment.NewLine}{GetExceptionMessage(ex)}");
+                combinedResult.TestResults.Add(new(ToolCallingGrade.F, TimeSpan.FromSeconds(0)));
             }
             finally
             {
@@ -278,43 +433,66 @@ namespace ToolCallingScratch
             }
 
             WriteLine($"""
-                `y
+                `w
                 
-                Combined Result:
-                ================
-                Average grade: {combinedResult.AverageGrade}
-                Average time:  {combinedResult.AverageTime.TotalMilliseconds:N0}ms
+                Combined Results for {model.Info.Name}:
+                ===============
+                Best grade:    {combinedResult.TestResults.Min(x => x.Grade)}.
+                Average grade: {combinedResult.AverageGrade}.
+                Best time:     {combinedResult.TestResults.Min(x => x.TotalTime.TotalMilliseconds):N0}ms.
+                Average time:  {combinedResult.AverageTime.TotalMilliseconds:N0}ms.
+
                 """);
 
             return combinedResult;
         }
 
-        static async Task<ExitCode> RunAllModelsAsync(ICatalog catalog, bool includeVariants)
+        static async Task<ExitCode> RunAsync(Options options, ICatalog catalog)
         {
-            var results = new List<string>[] { [], [], [], [], [], [] }; // one per grade, A-F.
+            List<ToolCallingResult> results = [];
 
-            var totals = await EnumerateAllCandidateModelsAsync(catalog, includeVariants,
-                async model => results[(int)(await RunOneModelAsync(model)).AverageGrade].Add(model.Info.Alias),
-                true);
+            await EnumerateAllCandidateModelsAsync(options, catalog,
+                async filterResult => results.Add((await RunOneModelVariantAsync(options, filterResult))));
+
+            int total = 0;
+            int ignored = 0;
+
+            WriteLine($"`w{"",30} |  Avg  |    Avg    |        |");
+            WriteLine($"`w{"Alias",30} | Grade | {"Time (ms)",9} | Device | EP [name] ");
+
+            foreach (var result in results)
+            {
+                if (result.FilterResult.MatchKind == ModelMatchKind.NotRequested)
+                {
+                    continue;
+                }
+
+                total++;
+                if (result.FilterResult.MatchKind == ModelMatchKind.DidntMatch)
+                {
+                    ignored++;
+                    continue;
+                }
+
+                var model = result.FilterResult.Model;
+                Write($"`w{model.Alias,30}");
+                Write($"`w |   ");
+                Write(GetGradeInColor(result.AverageGrade));
+                Write($"`w   | ");
+                Write($"`w{result.AverageTime.TotalMilliseconds,9:N0}");
+                Write($"`w | ");
+                Write(GetDeviceTypeInColor(model));
+                Write($"`w | ");
+                WriteLine($"`d{model.Info.Runtime!.ExecutionProvider} [{model.Info.Name}]");
+            }
 
             WriteLine($"""
-                `w
-                Results
-                =======
-                      A: {GetLine(ToolCallingGrade.A)}
-                      B: {GetLine(ToolCallingGrade.B)}
-                         --- failing grades ---
-                      E: {GetLine(ToolCallingGrade.E)}
-                      F: {GetLine(ToolCallingGrade.F)}
-
-                Ignored: {totals.Ignored,2}
-                -------------
-                  Total: {totals.Total,2}
+                `wRan: {total - ignored};
+                Ignored: {ignored};
+                Total: {total};
                 """);
 
             return ExitCode.Success;
-
-            string GetLine(ToolCallingGrade grade) => $"{results[(int)grade].Count,2} {string.Join(", ", results[(int)grade])}";
         }
 
         static bool IsCorrectFunctionCall(FunctionCall call, ModelTest test)
@@ -343,7 +521,7 @@ namespace ToolCallingScratch
             return true;
         }
 
-        static async Task<ToolCallingGrade> ExecutePromptAsync(OpenAIChatClient client, ModelTest test)
+        static async Task<ToolCallingGrade> ExecutePromptAsync(Options options, OpenAIChatClient client, ModelTest test)
         {
             ToolCallingGrade exitCode = ToolCallingGrade.F;
             List<ChatMessage> messages = [systemChatMessage];
@@ -351,7 +529,11 @@ namespace ToolCallingScratch
 
             try
             {
-                var response = await TimeActionAsync(() => client.CompleteChatAsync(messages, toolDefinitions, new CancellationTokenSource(TimeSpan.FromSeconds(chatTimeoutInSeconds)).Token), $"Sending prompt '{test.UserPrompt}'");
+                var response = await TimeActionAsync(() => client.CompleteChatAsync(
+                    messages, toolDefinitions,
+                    new CancellationTokenSource(TimeSpan.FromSeconds(options.TimeoutInSeconds)).Token),
+                    $"Sending prompt '{test.UserPrompt}'");
+
                 var reply = response.Choices[0]!;
                 var message = reply.Message;
                 var content = message.Content!;
@@ -380,13 +562,13 @@ namespace ToolCallingScratch
                 }
                 else
                 {
-                    WriteLine($"`rGRADE: F. No detected attempt at calling a tool with the correct name / arguments.");
+                    WriteLine($"`rGRADE: F. Did not detect a tool-call, and could not brute-force it.");
                     exitCode = ToolCallingGrade.F;
                 }
             }
             catch (TaskCanceledException)
             {
-                WriteLine($"`rGRADE F: Chat took longer than {chatTimeoutInSeconds} seconds to respond.");
+                WriteLine($"`rGRADE F: Chat took longer than {options.TimeoutInSeconds} seconds to respond.");
                 exitCode = ToolCallingGrade.F;
             }
             catch (Exception ex)
@@ -577,85 +759,21 @@ namespace ToolCallingScratch
             "integer" => "number",
             _ => property.Type!
         };
-        static async Task<ModelCounts> EnumerateAllCandidateModelsAsync(ICatalog catalog, bool includeVariants, Func<IModel, Task> callback, bool showInfo)
+
+        static async Task EnumerateAllCandidateModelsAsync(Options options, ICatalog catalog, Func<ModelFilterResult, Task> callback)
         {
             var models = await TimeActionAsync(() => catalog.ListModelsAsync(), "Getting list of models");
-            return await EnumerateAllCandidateModelsAsync(models, includeVariants, callback, showInfo);
+            await EnumerateAllCandidateModelsAsync(options, models, callback);
         }
 
-        static async Task<ModelCounts> EnumerateAllCandidateModelsAsync(IEnumerable<IModel> models, bool includeVariants, Func<IModel, Task> callback, bool showInfo)
+        static async Task EnumerateAllCandidateModelsAsync(Options options, IEnumerable<IModel> models, Func<ModelFilterResult, Task> callback)
         {
-            int acceptable = 0;
-            int ignored = 0;
+            var filtered = options.Filter.GetAllMatches(models);
 
-            foreach (var model in models)
+            foreach (var filteredResult in filtered)
             {
-                if (includeVariants)
-                {
-                    var result = await EnumerateAllCandidateModelsAsync(model.Variants, false, callback, showInfo);
-                    acceptable += result.Acceptable;
-                    ignored += result.Ignored;
-                }
-                else
-                {
-                    if (!IsCandidateModel(model, showInfo))
-                    {
-                        ignored++;
-                        continue;
-                    }
-
-                    acceptable++;
-                    await callback(model);
-                }
+                await callback(filteredResult);
             }
-
-            return new(acceptable, ignored);
-        }
-
-        static bool IsCandidateModel([NotNullWhen(true)] IModel? model, bool showInfo)
-        {
-            if (model is null)
-            {
-                if (showInfo)
-                {
-                    WriteLine($"`oThe model you chose does not exist.");
-                }
-                return false;
-            }
-            if (!model.Info.SupportsToolCalling.HasValue || model.Info.SupportsToolCalling.Value == false)
-            {
-                if (showInfo)
-                {
-                    WriteLine($"`cModel {model.Info.Name} doesn't claim to support tool calling; ignoring.");
-                }
-                return false;
-            }
-            if (model.Info.FileSizeMb > maxFileSizeInMb)
-            {
-                if (showInfo)
-                {
-                    WriteLine($"`cModel {model.Info.Name} is too large ({model.Info.FileSizeMb:N0} MB); ignoring. (Increase minimum file size to include it.)");
-                }
-                return false;
-            }
-            if (model.Info.Runtime!.DeviceType is DeviceType.CPU && !allowCpu)
-            {
-                if (showInfo)
-                {
-                    WriteLine($"`cModel {model.Info.Name} only runs on the CPU; ignoring. (Enable CPU usage to include it; will be slow.)");
-                }
-                return false;
-            }
-            if (!registeredEps.Contains(model.Info.Runtime!.ExecutionProvider))
-            {
-                if (showInfo)
-                {
-                    WriteLine($"`cModel {model.Info.Name} not supported by any registered EP; ignoring.");
-                }
-                return false;
-            }
-
-            return true;
         }
 
         static string GetDeviceTypeInColor(IModel model)
@@ -666,6 +784,22 @@ namespace ToolCallingScratch
                 DeviceType.NPU => "`m (NPU)",
                 DeviceType.CPU => "`d (CPU)",
                 _ => "`r (Invalid)"
+            };
+        }
+
+        static string GetGradeInColor(AverageToolCallingGrade grade) => GetGradeInColor((int)grade);
+        static string GetGradeInColor(ToolCallingGrade grade) => GetGradeInColor((int)grade);
+        static string GetGradeInColor(int value)
+        {
+            return value switch
+            {
+                0 => "`gA",
+                1 => "`yB",
+                2 => "`oC",
+                3 => "`rD",
+                4 => "`rE",
+                5 => "`rF",
+                _ => "`b-"
             };
         }
 
