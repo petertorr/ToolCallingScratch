@@ -2,7 +2,7 @@
   "profiles": {
     "ToolCallingScratch": {
       "commandName": "Project",
-      "commandLineArgs": "run -a qwen3-4b -v -t 10"
+      "commandLineArgs": "run -a ministral-3-3b-instruct-2512-generic-cpu -c -v"
     },
     "all": {
       "commandName": "Project",

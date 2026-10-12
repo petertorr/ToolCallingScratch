@@ -56,12 +56,13 @@ namespace ToolCallingScratch
     {
         Matched,
         DidntMatch,
-        NotRequested // either explicitly ignored or not the asked-for model.
+        NotRequested,
+        ExplicitlyIgnored
     }
 
     record class ModelFilterResult(string Name, IModel Model, ModelMatchKind MatchKind, string? ReasonForOmission);
 
-    record class ModelFilter(string? Alias, int MaxSizeInMb, List<string> IgnoredModels, bool TryAllVariants, List<string> RegisteredEps, bool AllowCpu)
+    record class ModelFilter(List<string> SpecificModels, int MaxSizeInMb, List<string> IgnoredModels, bool TryAllVariants, List<string> RegisteredEps, bool AllowCpu)
     {
         internal static ModelFilter Default { get; } = new(null, int.MaxValue, [], false, [], false);
 
@@ -92,35 +93,37 @@ namespace ToolCallingScratch
         internal ModelMatchKind GetMatchResult([NotNullWhen(true)] IModel model, [NotNullWhen(false)] out string? reasonForOmission)
         {
             reasonForOmission = null;
-            if (Alias is not null && !model.Alias.Contains(Alias, StringComparison.OrdinalIgnoreCase))
+            if (SpecificModels.Count > 0 &&
+                !SpecificModels.Any(name => model.Alias.Contains(name, StringComparison.OrdinalIgnoreCase) ||
+                    model.Info.Name.Contains(name, StringComparison.OrdinalIgnoreCase)))
             {
-                reasonForOmission = $"Model {model.Info.Alias} doesn't match the requested alias.";
+                reasonForOmission = $"Model doesn't match a requested name or alias.";
                 return ModelMatchKind.NotRequested;
             }
-            if (IgnoredModels.Contains(model.Alias, StringComparer.OrdinalIgnoreCase) ||
-                IgnoredModels.Contains(model.Info.Name, StringComparer.OrdinalIgnoreCase))
+            if (IgnoredModels.Any(name => model.Alias.Contains(name, StringComparison.OrdinalIgnoreCase) ||
+                model.Info.Name.Contains(name, StringComparison.OrdinalIgnoreCase)))
             {
-                reasonForOmission = $"Model {model.Info.Name} is explicitly ignored.";
-                return ModelMatchKind.NotRequested;
+                reasonForOmission = $"Model is explicitly ignored.";
+                return ModelMatchKind.ExplicitlyIgnored;
             }
             if (!model.Info.SupportsToolCalling.HasValue || model.Info.SupportsToolCalling.Value == false)
             {
-                reasonForOmission = $"Model {model.Info.Name} doesn't support tool-calling.";
+                reasonForOmission = $"Model doesn't support tool-calling.";
                 return ModelMatchKind.DidntMatch;
             }
             if (model.Info.FileSizeMb > MaxSizeInMb)
             {
-                reasonForOmission = $"Model {model.Info.Name} is too large ({model.Info.FileSizeMb:N0} MB).";
+                reasonForOmission = $"Model is too large ({model.Info.FileSizeMb:N0} MB).";
                 return ModelMatchKind.DidntMatch;
             }
             if (model.Info.Runtime!.DeviceType is DeviceType.CPU && !AllowCpu)
             {
-                reasonForOmission = $"Model {model.Info.Name} only runs on the CPU.";
+                reasonForOmission = $"Model only runs on the CPU.";
                 return ModelMatchKind.DidntMatch;
             }
             if (RegisteredEps.Count > 0 && !RegisteredEps.Contains(model.Info.Runtime!.ExecutionProvider))
             {
-                reasonForOmission = $"Model {model.Info.Name} is not supported by any registered EP.";
+                reasonForOmission = $"Model is not supported by any registered EP.";
                 return ModelMatchKind.DidntMatch;
             }
 
@@ -184,7 +187,8 @@ namespace ToolCallingScratch
         {
             List,
             Run,
-            Help
+            Help,
+            Error
         }
 
         record class Options(string ExeName, ProgramAction Action, ModelFilter Filter, bool ForceToolUse, int TimeoutInSeconds)
@@ -202,8 +206,8 @@ namespace ToolCallingScratch
                 bool forceToolUse = false;
                 bool tryAllVariants = false;
                 int timeout = DefaultTimeoutInSeconds;
-                string? alias = null;
                 int maxSize = DefaultMaxFileSize;
+                List<string> requestedModels = [];
                 List<string> ignoredModels = [];
                 List<string> registeredEps = []; // will be filled out after loading.
                 ProgramAction action = ProgramAction.Help;
@@ -227,6 +231,8 @@ namespace ToolCallingScratch
                     return new(exe, action, ModelFilter.Default, forceToolUse, timeout);
                 }
 
+                bool parseSuccess = true;
+
                 // Start at 1, not 0, since we got the action from args[0]
                 for (index = 1; index < args.Length; ++index)
                 {
@@ -245,19 +251,19 @@ namespace ToolCallingScratch
                             break;
 
                         case "-t":
-                            ParseArgParam("-t", s => timeout = int.Parse(s), "a time in seconds");
+                            parseSuccess = ParseArgParam("-t", s => timeout = int.Parse(s), "a time in seconds");
                             break;
 
                         case "-a":
-                            ParseArgParam("-a", s => alias = s, "a model alias");
+                            parseSuccess = ParseArgParam("-a", s => requestedModels.Add(s), "a model alias");
                             break;
 
                         case "-m":
-                            ParseArgParam("-t", s => maxSize = int.Parse(s), "a file size in MB");
+                            parseSuccess = ParseArgParam("-t", s => maxSize = int.Parse(s), "a file size in MB");
                             break;
 
                         case "-i":
-                            ignoredModels.Add(args[index]);
+                            parseSuccess = ParseArgParam("-i", s => ignoredModels.Add(s), "a model name or alias to ignore");
                             break;
 
                         default:
@@ -265,23 +271,29 @@ namespace ToolCallingScratch
                             localIgnoredArgs.Add(args[index]);
                             break;
                     }
+
+                    if (!parseSuccess)
+                    {
+                        action = ProgramAction.Error;
+                        break;
+                    }
                 }
 
                 ignoredArgs = localIgnoredArgs;
-                return new(exe, action, new(alias, maxSize, ignoredModels, tryAllVariants, registeredEps, allowCpu), forceToolUse, timeout);
+                return new(exe, action, new(requestedModels, maxSize, ignoredModels, tryAllVariants, registeredEps, allowCpu), forceToolUse, timeout);
 
-                void ParseArgParam(string param, Action<string> callback, string description)
+                bool ParseArgParam(string param, Action<string> callback, string description)
                 {
                     if (index < args.Length - 1)
                     {
                         ++index;
                         callback(args[index]);
+                        return true;
                     }
-                    else
-                    {
-                        WriteLine($"`r-{param} option needs {description}.");
-                        localIgnoredArgs.Add(args[index]);
-                    }
+
+                    WriteLine($"`r{param} option needs {description}.");
+                    localIgnoredArgs.Add(args[index]);
+                    return false;
                 }
             }
         }
@@ -289,15 +301,16 @@ namespace ToolCallingScratch
         static async Task<int> Main(string[] args)
         {
             var options = Options.Parse(args, out var ignoredArgs);
-            if (ignoredArgs.Count > 0)
-            {
-                WriteLine($"`oIgnoring unknown arguments {string.Join(", ", ignoredArgs)}");
-            }
 
-            if (options.Action == ProgramAction.Help)
+            if (options.Action is ProgramAction.Help or ProgramAction.Error)
             {
                 Usage(options.ExeName);
                 return (int)ExitCode.Other;
+            }
+
+            if (ignoredArgs.Count > 0)
+            {
+                WriteLine($"`oIgnoring unknown arguments {string.Join(", ", ignoredArgs)}");
             }
 
             var sw = Stopwatch.StartNew();
@@ -311,14 +324,14 @@ namespace ToolCallingScratch
                 WriteLine($"""
                     `wArchitecture: {RuntimeInformation.ProcessArchitecture}.
                     Registered EPs: {string.Join(", ", eps.RegisteredEps)}.
-                    Chosen model(s): {(options.Filter.Alias is not null ? options.Filter.Alias : "all")}{(options.Filter.TryAllVariants ? " (with variants)" : "")}.
+                    Chosen model(s): {(options.Filter.SpecificModels.Count > 1 ? string.Join(", ", options.Filter.SpecificModels) : "all")}{(options.Filter.TryAllVariants ? " (with variants)" : "")}.
                     Timeout (seconds): {options.TimeoutInSeconds}.
                     Forcing tool usage: {options.ForceToolUse}.
                     Max model size: {options.Filter.MaxSizeInMb}.
                     """);
                 if (options.Filter.IgnoredModels.Count > 0)
                 {
-                    WriteLine($"`yIgnoring model(s): {string.Join(", ", options.Filter.IgnoredModels)}.");
+                    WriteLine($"`oIgnoring model(s): {string.Join(", ", options.Filter.IgnoredModels)}.");
                 }
                 if (eps.FailedEps.Length > 0)
                 {
@@ -358,10 +371,11 @@ namespace ToolCallingScratch
                    2) {exe} run [options]   - runs test for models that match the given filters.
                    3) {exe} help            - this text.
 
-                Options:
-                   -a <alias>     A model alias like 'qwen3-4b' to select (partial match). By default, all models are selected.
+                Options (all are optional):
+                   -a <model>     Name or alias of a model to select (substring match). Can be specified more than once.
+                                  If choosing a specific name (not alias), you must include the '-v' option.
                    -m <fileSize>  Maximum model file size allowed, in MB. Default is {Options.DefaultMaxFileSize}.
-                   -i <model>     Name or alias of a model to ignore. Can be specified multiple times.
+                   -i <model>     Name or alias of a model to ignore (substring match). Can be specified more than once.
                    -t <time>      Time, in seconds, to wait for the model to respond. Default is {Options.DefaultTimeoutInSeconds}.
                    -f             Force tool calling (vs. leaving it as "auto").
                    -c             Enable CPU-based models, if applicable for your hardware.
@@ -398,7 +412,7 @@ namespace ToolCallingScratch
             var combinedResult = new ToolCallingResult(filterResult);
             if (filterResult.MatchKind != ModelMatchKind.Matched)
             {
-                if (filterResult.MatchKind == ModelMatchKind.DidntMatch)
+                if (filterResult.MatchKind is ModelMatchKind.DidntMatch or ModelMatchKind.ExplicitlyIgnored)
                 {
                     WriteLine($"`cIgnoring {filterResult.Name}: {filterResult.ReasonForOmission}");
                 }
@@ -462,7 +476,7 @@ namespace ToolCallingScratch
 
             foreach (var result in results)
             {
-                if (result.FilterResult.MatchKind == ModelMatchKind.NotRequested)
+                if (result.FilterResult.MatchKind is ModelMatchKind.NotRequested or ModelMatchKind.ExplicitlyIgnored)
                 {
                     continue;
                 }
