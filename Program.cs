@@ -6,7 +6,6 @@ using Microsoft.Extensions.Logging.Abstractions;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.InteropServices;
-using System.Text.RegularExpressions;
 
 namespace ToolCallingScratch
 {
@@ -35,19 +34,20 @@ namespace ToolCallingScratch
         Ineligible = 99
     }
 
-    record class IndividualTestResult(TestGrade Grade, TimeSpan TotalTime);
-    class ToolCallingResults(ModelFilterResult filterResult)
+    class TestSuiteResults(ModelFilter.MatchInfo filterResult)
     {
-        public ModelFilterResult FilterResult { get; } = filterResult;
+        public record class IndividualTestResult(TestGrade Grade, TimeSpan TotalTime);
+
+        public ModelFilter.MatchInfo FilterResult { get; } = filterResult;
         public List<IndividualTestResult> TestResults { get; } = [];
         public List<IndividualTestResult> EligibleTestResults => TestResults.Where(x => x.Grade != TestGrade.Ineligible).ToList();
         public AverageTestGrade AverageGrade => (AverageTestGrade)(int)((float)TestResults.Sum(x => (int)x.Grade) / TestResults.Count + 0.8f); // +0.8f to nudge grade downwards.
         public TimeSpan AverageTime => TimeSpan.FromMilliseconds(TestResults.Sum(x => x.TotalTime.TotalMilliseconds) / TestResults.Count);
     }
 
-    record class ModelTest(string UserPrompt, string ExpectedFunctionName, Dictionary<string, string> ExpectedArguments);
+    record class ToolCallingTestMetadata(string UserPrompt, string ExpectedFunctionName, Dictionary<string, string> ExpectedArguments);
 
-    enum ModelMatchKind
+    internal enum ModelMatchKind
     {
         Matched,
         DidntMatch,
@@ -55,17 +55,16 @@ namespace ToolCallingScratch
         ExplicitlyIgnored
     }
 
-    record class ModelFilterResult(string Name, IModel Model, ModelMatchKind MatchKind, string? ReasonForOmission);
-
     record class ModelFilter(List<string> SpecificModels, int MaxSizeInMb, List<string> IgnoredModels, bool TryAllVariants, List<string> RegisteredEps, bool AllowCpu)
     {
+        internal record class MatchInfo(string Name, IModel Model, ModelMatchKind MatchKind, string? ReasonForOmission);
         internal const int DefaultMaxFileSize = 6 * 1_024; // 6 gigs; reasonable default for machines with 16 GB of RAM.
 
         internal static ModelFilter Default { get; } = new([], DefaultMaxFileSize, [], false, [], false);
 
-        internal List<ModelFilterResult> GetAllMatches(IEnumerable<IModel> models)
+        internal List<MatchInfo> GetAllMatches(IEnumerable<IModel> models)
         {
-            List<ModelFilterResult> results = [];
+            List<MatchInfo> results = [];
             var optionsNoVariants = this with { TryAllVariants = false };
 
             foreach (var model in models)
@@ -91,14 +90,14 @@ namespace ToolCallingScratch
         {
             reasonForOmission = null;
 
-            if (SpecificModels.Count > 0 && !SpecificModels.Any(name => 
+            if (SpecificModels.Count > 0 && !SpecificModels.Any(name =>
                     model.Alias.Contains(name, StringComparison.OrdinalIgnoreCase) ||
                     model.Info.Name.Contains(name, StringComparison.OrdinalIgnoreCase)))
             {
                 reasonForOmission = $"`oModel doesn't match a requested name or alias.";
                 return ModelMatchKind.NotRequested;
             }
-            if (IgnoredModels.Any(name => 
+            if (IgnoredModels.Any(name =>
                 model.Alias.Contains(name, StringComparison.OrdinalIgnoreCase) ||
                 model.Info.Name.Contains(name, StringComparison.OrdinalIgnoreCase)))
             {
@@ -127,6 +126,137 @@ namespace ToolCallingScratch
             }
 
             return ModelMatchKind.Matched;
+        }
+    }
+
+    enum ProgramAction
+    {
+        List,
+        Run,
+        Help,
+        Error
+    }
+
+    record class Options(string ExeName, ProgramAction Action, ModelFilter Filter, bool RequireToolUse, bool BruteForce, bool ShowVerbatimResponses, int TimeoutInSeconds)
+    {
+        internal const int DefaultTimeoutInSeconds = 60 * 1; // Time to wait for an answer. It's a trivial prompt...
+
+        internal static Options Parse(string[] args, out List<string> ignoredArgs)
+        {
+            int index = 0;
+            ignoredArgs = [];
+            List<string> localIgnoredArgs = [];
+            var exe = Path.GetFileNameWithoutExtension(Environment.ProcessPath)!;
+            bool allowCpu = false;
+            bool requireToolUse = false;
+            bool tryAllVariants = false;
+            bool bruteForce = false;
+            bool showVerbatimResponses = false;
+            int timeout = DefaultTimeoutInSeconds;
+            int maxSize = ModelFilter.DefaultMaxFileSize;
+            List<string> requestedModels = [];
+            List<string> ignoredModels = [];
+            List<string> registeredEps = []; // will be filled out after loading.
+            ProgramAction action = ProgramAction.Help;
+
+            // Specifying nothing is the same as 'run' with no other args
+            if (args.Length == 0)
+            {
+                return new(exe, ProgramAction.Run, ModelFilter.Default, requireToolUse, bruteForce, showVerbatimResponses, timeout);
+            }
+
+            if (args[0].Equals("help", StringComparison.OrdinalIgnoreCase))
+            {
+                return new(exe, ProgramAction.Help, ModelFilter.Default, requireToolUse, bruteForce, showVerbatimResponses, timeout);
+            }
+            if (args[0].Equals("list", StringComparison.OrdinalIgnoreCase))
+            {
+                action = ProgramAction.List;
+            }
+            else if (args[0].Equals("run", StringComparison.OrdinalIgnoreCase))
+            {
+                action = ProgramAction.Run;
+            }
+            else
+            {
+                localIgnoredArgs.AddRange(args[1..]);
+                return new(exe, action, ModelFilter.Default, requireToolUse, bruteForce, showVerbatimResponses, timeout);
+            }
+
+            bool parseSuccess = true;
+
+            // Start at 1, not 0, since we got the action from args[0]
+            for (index = 1; index < args.Length; ++index)
+            {
+                switch (args[index].ToLowerInvariant())
+                {
+                    case "-v":
+                        tryAllVariants = true;
+                        break;
+
+                    case "-c":
+                        allowCpu = true;
+                        break;
+
+                    case "-f":
+                        requireToolUse = true;
+                        break;
+
+                    case "-b":
+                        bruteForce = true;
+                        break;
+
+                    case "-r":
+                        showVerbatimResponses = true;
+                        break;
+
+                    case "-t":
+                        parseSuccess = ParseArgParam("-t", s => timeout = int.Parse(s), "a time in seconds");
+                        break;
+
+                    case "-m":
+                        parseSuccess = ParseArgParam("-m", requestedModels.Add, "a model alias");
+                        break;
+
+                    case "-s":
+                        parseSuccess = ParseArgParam("-s", s => maxSize = int.Parse(s), "a file size in MB");
+                        break;
+
+                    case "-i":
+                        parseSuccess = ParseArgParam("-i", ignoredModels.Add, "a model name or alias to ignore");
+                        break;
+
+                    default:
+                        Program.WriteLine($"`r{args[index]} option not recognized.");
+                        localIgnoredArgs.Add(args[index]);
+                        break;
+                }
+
+                if (!parseSuccess)
+                {
+                    action = ProgramAction.Error;
+                    break;
+                }
+            }
+
+            ignoredArgs = localIgnoredArgs;
+            return new(exe, action,
+                new(requestedModels, maxSize, ignoredModels, tryAllVariants, registeredEps, allowCpu),
+                requireToolUse, bruteForce, showVerbatimResponses, timeout);
+
+            bool ParseArgParam(string param, Action<string> callback, string description)
+            {
+                if (index < args.Length - 1)
+                {
+                    ++index;
+                    callback(args[index]);
+                    return true;
+                }
+
+                Program.WriteLine($"`r{param} option needs {description}.");
+                localIgnoredArgs.Add(args[index]);
+                return false;
+            }
         }
     }
 
@@ -159,159 +289,28 @@ namespace ToolCallingScratch
             ),
             ];
 
-        static readonly ModelTest WeatherTest = new("What is the weather in Seattle?", "getWeather", new()
+        static readonly ToolCallingTestMetadata WeatherTest = new("What is the weather in Seattle?", "getWeather", new()
         {
             ["city"] = "Seattle"
         });
 
-        static readonly ModelTest CurrencyTest = new("What is 5 USD converted to AUD?", "convertCurrency", new()
+        static readonly ToolCallingTestMetadata CurrencyTest = new("What is 5 USD converted to AUD?", "convertCurrency", new()
         {
             ["amount"] = "5",
             ["from"] = "USD",
             ["to"] = "AUD"
         });
 
-        static readonly ModelTest FileWriteTest = new("Write the string 'hello world' into the file named testing.txt. If the file already exists, overwrite it", "writeFile", new()
+        static readonly ToolCallingTestMetadata FileWriteTest = new("Write the string 'hello world' into the file named testing.txt. If the file already exists, overwrite it", "writeFile", new()
         {
             ["filename"] = "testing.txt",
             ["contents"] = "hello world",
             ["overwrite"] = "True" // upper-case 'T' because we're ToString()-ing the JsonElement.
         });
 
-        static readonly List<ModelTest> AllTests = [WeatherTest, CurrencyTest, FileWriteTest];
+        static readonly List<ToolCallingTestMetadata> AllTests = [WeatherTest, CurrencyTest, FileWriteTest];
 
         const int maxErrorMessageLength = 500; // Truncate error messages longer than this.
-
-        enum ProgramAction
-        {
-            List,
-            Run,
-            Help,
-            Error
-        }
-
-        record class Options(string ExeName, ProgramAction Action, ModelFilter Filter, bool RequireToolUse, bool BruteForce, bool ShowVerbatimResponses, int TimeoutInSeconds)
-        {
-            internal const int DefaultTimeoutInSeconds = 60 * 1; // Time to wait for an answer. It's a trivial prompt...
-
-            internal static Options Parse(string[] args, out List<string> ignoredArgs)
-            {
-                int index = 0;
-                ignoredArgs = [];
-                List<string> localIgnoredArgs = [];
-                var exe = Path.GetFileNameWithoutExtension(Environment.ProcessPath)!;
-                bool allowCpu = false;
-                bool requireToolUse = false;
-                bool tryAllVariants = false;
-                bool bruteForce = false;
-                bool showVerbatimResponses = false;
-                int timeout = DefaultTimeoutInSeconds;
-                int maxSize = ModelFilter.DefaultMaxFileSize;
-                List<string> requestedModels = [];
-                List<string> ignoredModels = [];
-                List<string> registeredEps = []; // will be filled out after loading.
-                ProgramAction action = ProgramAction.Help;
-
-                // Specifying nothing is the same as 'run' with no other args
-                if (args.Length == 0)
-                {
-                    return new(exe, ProgramAction.Run, ModelFilter.Default, requireToolUse, bruteForce, showVerbatimResponses, timeout);
-                }
-
-                if (args[0].Equals("help", StringComparison.OrdinalIgnoreCase))
-                {
-                    return new(exe, ProgramAction.Help, ModelFilter.Default, requireToolUse, bruteForce, showVerbatimResponses, timeout);
-                }
-                if (args[0].Equals("list", StringComparison.OrdinalIgnoreCase))
-                {
-                    action = ProgramAction.List;
-                }
-                else if (args[0].Equals("run", StringComparison.OrdinalIgnoreCase))
-                {
-                    action = ProgramAction.Run;
-                }
-                else
-                {
-                    localIgnoredArgs.AddRange(args[1..]);
-                    return new(exe, action, ModelFilter.Default, requireToolUse, bruteForce, showVerbatimResponses, timeout);
-                }
-
-                bool parseSuccess = true;
-
-                // Start at 1, not 0, since we got the action from args[0]
-                for (index = 1; index < args.Length; ++index)
-                {
-                    switch (args[index].ToLowerInvariant())
-                    {
-                        case "-v":
-                            tryAllVariants = true;
-                            break;
-
-                        case "-c":
-                            allowCpu = true;
-                            break;
-
-                        case "-f":
-                            requireToolUse = true;
-                            break;
-
-                        case "-b":
-                            bruteForce = true;
-                            break;
-
-                        case "-r":
-                            showVerbatimResponses = true;
-                            break;
-
-                        case "-t":
-                            parseSuccess = ParseArgParam("-t", s => timeout = int.Parse(s), "a time in seconds");
-                            break;
-
-                        case "-m":
-                            parseSuccess = ParseArgParam("-m", requestedModels.Add, "a model alias");
-                            break;
-
-                        case "-s":
-                            parseSuccess = ParseArgParam("-s", s => maxSize = int.Parse(s), "a file size in MB");
-                            break;
-
-                        case "-i":
-                            parseSuccess = ParseArgParam("-i", ignoredModels.Add, "a model name or alias to ignore");
-                            break;
-
-                        default:
-                            WriteLine($"`r{args[index]} option not recognized.");
-                            localIgnoredArgs.Add(args[index]);
-                            break;
-                    }
-
-                    if (!parseSuccess)
-                    {
-                        action = ProgramAction.Error;
-                        break;
-                    }
-                }
-
-                ignoredArgs = localIgnoredArgs;
-                return new(exe, action, 
-                    new(requestedModels, maxSize, ignoredModels, tryAllVariants, registeredEps, allowCpu),
-                    requireToolUse, bruteForce, showVerbatimResponses, timeout);
-
-                bool ParseArgParam(string param, Action<string> callback, string description)
-                {
-                    if (index < args.Length - 1)
-                    {
-                        ++index;
-                        callback(args[index]);
-                        return true;
-                    }
-
-                    WriteLine($"`r{param} option needs {description}.");
-                    localIgnoredArgs.Add(args[index]);
-                    return false;
-                }
-            }
-        }
 
         static async Task<int> Main(string[] args)
         {
@@ -431,9 +430,9 @@ namespace ToolCallingScratch
             return total > 0 ? ExitCode.Success : ExitCode.Fail;
         }
 
-        static async Task<ToolCallingResults> RunOneModelVariantAsync(Options options, ModelFilterResult filterResult)
+        static async Task<TestSuiteResults> RunOneModelVariantAsync(Options options, ModelFilter.MatchInfo filterResult)
         {
-            var combinedResult = new ToolCallingResults(filterResult);
+            var combinedResult = new TestSuiteResults(filterResult);
             if (filterResult.MatchKind != ModelMatchKind.Matched)
             {
                 if (filterResult.MatchKind is ModelMatchKind.DidntMatch or ModelMatchKind.ExplicitlyIgnored)
@@ -487,7 +486,7 @@ namespace ToolCallingScratch
 
         static async Task<ExitCode> RunAsync(Options options, ICatalog catalog)
         {
-            List<ToolCallingResults> results = [];
+            List<TestSuiteResults> results = [];
 
             await EnumerateAllCandidateModelsAsync(options, catalog,
                 async filterResult => results.Add((await RunOneModelVariantAsync(options, filterResult))));
@@ -527,7 +526,7 @@ namespace ToolCallingScratch
             return ExitCode.Success;
         }
 
-        static bool IsExpectedFunctionCall(FunctionCall call, ModelTest test)
+        static bool IsExpectedFunctionCall(FunctionCall call, ToolCallingTestMetadata test)
         {
             if (call.Name != test.ExpectedFunctionName)
             {
@@ -553,7 +552,7 @@ namespace ToolCallingScratch
             return true;
         }
 
-        static async Task<TestGrade> ExecutePromptAsync(Options options, OpenAIChatClient client, ModelTest test)
+        static async Task<TestGrade> ExecutePromptAsync(Options options, OpenAIChatClient client, ToolCallingTestMetadata test)
         {
             TestGrade exitCode = TestGrade.F;
             List<ChatMessage> messages = [systemChatMessage];
@@ -589,8 +588,8 @@ namespace ToolCallingScratch
                     }
                 }
                 // Try to brute-force it
-                else if (options.BruteForce && 
-                    TryBruteForceFunctionCall(message.Content!, toolDefinitions, out var toolCall)
+                else if (options.BruteForce &&
+                    BruteForceToolCallParser.TryBruteForceFunctionCall(message.Content!, toolDefinitions, out var toolCall)
                     && IsExpectedFunctionCall(toolCall, test))
                 {
                     WriteLine($"GRADE: {GetGradeInColor(TestGrade.B)}");
@@ -618,202 +617,13 @@ namespace ToolCallingScratch
             return exitCode;
         }
 
-        // Letter or underscore, followed by any number of letters, underscores, digits, or periods
-        // (Normal identifiers don't allow periods, but for tools people may like to use "noun.verb"
-        // so it is allowed here
-        const string identifierRegEx = """
-            [a-zA-Z_](?:[a-zA-Z_0-9\.])*
-            """;
-
-        // A quote, followed by zero or more non-quote chars OR escaped quotes (with no embedded newlines).
-        const string quotedStringRegEx = """
-            "(?:[^"\r\n]|(?:\"))*?"
-            """;
-
-        // 1 or more digits followed by an optional period and one or more digits.
-        // JSON doesn't support a leading decimal point (like ".1234") we don't match that.
-        const string numberRegEx = """
-            \d+(?:\.\d+)?
-            """;
-
-        const string boolRegEx = """
-            true|false
-            """;
-
-        const string nullRegEx = """
-            null
-            """;
-
-        static readonly Regex propertyNameRegex = new($"(?<identifier>{identifierRegEx})|(?<string>{quotedStringRegEx})", RegexOptions.Multiline);
-
-        static readonly Regex propertyValueRegex = new($"(?<string>{quotedStringRegEx})|(?<number>{numberRegEx})|(?<boolean>{boolRegEx})|(?<null>{nullRegEx})", RegexOptions.IgnoreCase);
-
-        /// <summary>
-        /// Tries to brute-force a function call from message content. It's based on a pedestrian 
-        /// parsing of the text for appropriate names / values in the right order. Explicitly does
-        /// not require JSON parsing, as many models return partial JSON, XML, or other formats.
-        /// </summary>
-        /// <param name="rawMessageContent">The raw content of the message.</param>
-        /// <param name="tools">The set of registered tools to check for.</param>
-        /// <param name="function">If successful, the detected function call.</param>
-        /// <returns>True if a function call was detected; otherwise false</returns>
-        /// <remarks>
-        /// For each ToolDefinition in 'tools', the parser does the following:
-        /// 
-        /// 1) Check for last occurence of its name (to skip over any prose like "I need to call...").
-        ///    * If there is none, go to next tool.
-        ///
-        /// 2) Parse the rest of the string into the following tokens (all other chars are ignored):
-        ///    * Identifier (typical C-style identifier, but also allows embedded periods).
-        ///    * Quoted String (including the empty string and strings with escaped quotes).
-        ///    * Boolean literal.
-        ///    * Numeric literal (including floats).
-        ///    * null literal.
-        ///
-        /// 3) Attempts to match the remaining tokens against the arguments defined by
-        ///    the tool, in the form of <property-name> followed by <property-value>.
-        ///    * Any string that isn't a valid argument name is ignored
-        ///    * Only simple properties are supported (not arrays or nested objects).
-        ///
-        /// Arguments can be in any order, but this function assumes ALL defined parameters are required.
-        /// </remarks>
-        static bool TryBruteForceFunctionCall(string rawMessageContent, IEnumerable<ToolDefinition> tools, [NotNullWhen(true)] out FunctionCall? function)
-        {
-            function = null;
-            foreach (var tool in tools)
-            {
-                var functionName = tool.Function!.Name;
-                var parameters = tool.Function!.Parameters.Properties!;
-                var arguments = new Dictionary<string, string>();
-
-                var quotedFunctionName = $@"""{functionName}""";
-                int foundLength;
-                int index = rawMessageContent.LastIndexOf(quotedFunctionName);
-                if (index >= 0)
-                {
-                    foundLength = quotedFunctionName.Length;
-                }
-                else
-                {
-                    // Look for unquoted name, like a C-style function call
-                    index = rawMessageContent.LastIndexOf(functionName);
-                    if (index < 0)
-                    {
-                        continue;
-                    }
-                    foundLength = functionName.Length;
-                }
-
-                int offset = index + foundLength;
-                while (offset < rawMessageContent.Length && arguments.Count < parameters.Count)
-                {
-                    // Search for the next property name
-                    var match = propertyNameRegex.Match(rawMessageContent, offset);
-                    offset = match.Index + match.Length;
-                    if (!match.Success)
-                    {
-                        // No tokens; can't be a call.
-                        break;
-                    }
-
-                    string propertyName;
-                    // If it was an identifier, use it as-is, otherwise strip the quotes
-                    if (match.Groups["identifier"].Captures.Count > 0)
-                    {
-                        propertyName = match.Value;
-                    }
-                    else
-                    {
-                        propertyName = match.Value[1..^1];
-                    }
-
-                    if (string.IsNullOrEmpty(propertyName))
-                    {
-                        // It was an empty string; can't be a call.
-                        break;
-                    }
-
-                    // Does it match a known parameter?
-                    if (!parameters.TryGetValue(propertyName, out var propertyDefinition))
-                    {
-                        // Probably "arguments" or another ignorable string.
-                        // Keep looking.
-                        continue;
-                    }
-
-                    // Now look for the property value
-                    match = propertyValueRegex.Match(rawMessageContent, offset);
-                    offset = match.Index + match.Length;
-                    if (!match.Success)
-                    {
-                        // No property value; can't be a legit call
-                        break;
-                    }
-
-                    // Check if we captured anything of the right group (string, number, etc).
-                    var groupName = GetRegexGroupName(propertyDefinition);
-                    var targetGroup = match.Groups[groupName];
-
-                    // Note that strings can also match the null literal.
-                    if (targetGroup.Captures.Count == 0 && propertyDefinition.Type == "string")
-                    {
-                        targetGroup = match.Groups["null"];
-                    }
-
-                    if (targetGroup.Captures.Count == 0)
-                    {
-                        // Wasn't the correct type; bail
-                        break;
-                    }
-
-                    var propertyValue = targetGroup.Value;
-
-                    // For bools and null, convert to lower-case (we match case-insensitive because some models
-                    // insist on using 'True' instead of 'true'... and they might do something similar for null)
-                    if (targetGroup.Name is "boolean" or "null")
-                    {
-                        propertyValue = propertyValue.ToLowerInvariant();
-                    }
-
-                    arguments.Add($@"""{propertyName}""", propertyValue);
-                }
-
-                if (arguments.Count != parameters.Count)
-                {
-                    // Not enough args; try the next tool
-                    // Note this assumes all args are required (could be relaxed)
-                    continue;
-                }
-
-                // If we got here, the call was a success
-                function = new FunctionCall
-                {
-                    Name = functionName,
-                    Arguments = $$"""
-                        { {{string.Join(", ", arguments.Select(i => i.Key + " : " + i.Value))}} }
-                        """
-                };
-
-                return true;
-            }
-
-            // Didn't find anything that matched.
-            return false;
-        }
-
-        static string GetRegexGroupName(PropertyDefinition property) => property.Type switch
-        {
-            "integer" => "number",
-            _ => property.Type!
-        };
-
-        static async Task EnumerateAllCandidateModelsAsync(Options options, ICatalog catalog, Func<ModelFilterResult, Task> callback)
+        static async Task EnumerateAllCandidateModelsAsync(Options options, ICatalog catalog, Func<ModelFilter.MatchInfo, Task> callback)
         {
             var models = await TimeActionAsync(() => catalog.ListModelsAsync(), "Getting list of models");
             await EnumerateAllCandidateModelsAsync(options, models, callback);
         }
 
-        static async Task EnumerateAllCandidateModelsAsync(Options options, IEnumerable<IModel> models, Func<ModelFilterResult, Task> callback)
+        static async Task EnumerateAllCandidateModelsAsync(Options options, IEnumerable<IModel> models, Func<ModelFilter.MatchInfo, Task> callback)
         {
             var filtered = options.Filter.GetAllMatches(models);
 
@@ -854,14 +664,14 @@ namespace ToolCallingScratch
         {
             WriteLine($"""
                 
-                `w{new string('-', 50)}
+                `w{new string('-', 10)}
                 `wAlias: `x{model.Alias}, `wDevice: {GetDeviceTypeInColor(model)}, `wSize: `x{model.Info.FileSizeMb:N0} MB, `wFull Name: `x{model.Info.Name}, `wEP: `x{model.Info.Runtime!.ExecutionProvider}
                 """);
         }
 
-        static void WriteLine(string content) => Write(content + Environment.NewLine);
+        internal static void WriteLine(string content) => Write(content + Environment.NewLine);
 
-        static void Write(string content)
+        internal static void Write(string content)
         {
             int totalLength = content.Length;
             for (int i = 0; i < content.Length; ++i)
