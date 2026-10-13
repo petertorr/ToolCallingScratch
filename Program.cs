@@ -18,7 +18,7 @@ namespace ToolCallingScratch
         Other = 99      // Something else.
     }
 
-    enum ToolCallingGrade
+    enum TestGrade
     {
         A = 0,  // Perfect. Requested a tool call with correct payload.
         B = 1,  // Acceptable. Output wasn't a proper tool call, but payload can be used with brute-force parsing hacks.
@@ -29,24 +29,19 @@ namespace ToolCallingScratch
         Ineligible = 99
     }
 
-    enum AverageToolCallingGrade
+    enum AverageTestGrade
     {
         A, B, C, D, E, F,
         Ineligible = 99
     }
 
-    record class ModelCounts(int Acceptable, int Ignored)
-    {
-        public int Total => Acceptable + Ignored;
-    }
-
-    record class ToolCallingIndividualTestResult(ToolCallingGrade Grade, TimeSpan TotalTime);
-    class ToolCallingResult(ModelFilterResult filterResult)
+    record class IndividualTestResult(TestGrade Grade, TimeSpan TotalTime);
+    class ToolCallingResults(ModelFilterResult filterResult)
     {
         public ModelFilterResult FilterResult { get; } = filterResult;
-        public List<ToolCallingIndividualTestResult> TestResults { get; } = [];
-        public List<ToolCallingIndividualTestResult> EligibleTestResults => TestResults.Where(x => x.Grade != ToolCallingGrade.Ineligible).ToList();
-        public AverageToolCallingGrade AverageGrade => (AverageToolCallingGrade)(int)((float)TestResults.Sum(x => (int)x.Grade) / TestResults.Count + 0.8f); // +0.8f to nudge grade downwards.
+        public List<IndividualTestResult> TestResults { get; } = [];
+        public List<IndividualTestResult> EligibleTestResults => TestResults.Where(x => x.Grade != TestGrade.Ineligible).ToList();
+        public AverageTestGrade AverageGrade => (AverageTestGrade)(int)((float)TestResults.Sum(x => (int)x.Grade) / TestResults.Count + 0.8f); // +0.8f to nudge grade downwards.
         public TimeSpan AverageTime => TimeSpan.FromMilliseconds(TestResults.Sum(x => x.TotalTime.TotalMilliseconds) / TestResults.Count);
     }
 
@@ -64,7 +59,9 @@ namespace ToolCallingScratch
 
     record class ModelFilter(List<string> SpecificModels, int MaxSizeInMb, List<string> IgnoredModels, bool TryAllVariants, List<string> RegisteredEps, bool AllowCpu)
     {
-        internal static ModelFilter Default { get; } = new(null, int.MaxValue, [], false, [], false);
+        internal const int DefaultMaxFileSize = 6 * 1_024; // 6 gigs; reasonable default for machines with 16 GB of RAM.
+
+        internal static ModelFilter Default { get; } = new([], DefaultMaxFileSize, [], false, [], false);
 
         internal List<ModelFilterResult> GetAllMatches(IEnumerable<IModel> models)
         {
@@ -90,40 +87,42 @@ namespace ToolCallingScratch
             return results;
         }
 
-        internal ModelMatchKind GetMatchResult([NotNullWhen(true)] IModel model, [NotNullWhen(false)] out string? reasonForOmission)
+        internal ModelMatchKind GetMatchResult(IModel model, [NotNullWhen(false)] out string? reasonForOmission)
         {
             reasonForOmission = null;
-            if (SpecificModels.Count > 0 &&
-                !SpecificModels.Any(name => model.Alias.Contains(name, StringComparison.OrdinalIgnoreCase) ||
+
+            if (SpecificModels.Count > 0 && !SpecificModels.Any(name => 
+                    model.Alias.Contains(name, StringComparison.OrdinalIgnoreCase) ||
                     model.Info.Name.Contains(name, StringComparison.OrdinalIgnoreCase)))
             {
-                reasonForOmission = $"Model doesn't match a requested name or alias.";
+                reasonForOmission = $"`oModel doesn't match a requested name or alias.";
                 return ModelMatchKind.NotRequested;
             }
-            if (IgnoredModels.Any(name => model.Alias.Contains(name, StringComparison.OrdinalIgnoreCase) ||
+            if (IgnoredModels.Any(name => 
+                model.Alias.Contains(name, StringComparison.OrdinalIgnoreCase) ||
                 model.Info.Name.Contains(name, StringComparison.OrdinalIgnoreCase)))
             {
-                reasonForOmission = $"Model is explicitly ignored.";
+                reasonForOmission = $"`oModel is explicitly ignored.";
                 return ModelMatchKind.ExplicitlyIgnored;
             }
             if (!model.Info.SupportsToolCalling.HasValue || model.Info.SupportsToolCalling.Value == false)
             {
-                reasonForOmission = $"Model doesn't support tool-calling.";
+                reasonForOmission = $"`oModel doesn't support tool-calling.";
                 return ModelMatchKind.DidntMatch;
             }
             if (model.Info.FileSizeMb > MaxSizeInMb)
             {
-                reasonForOmission = $"Model is too large ({model.Info.FileSizeMb:N0} MB).";
+                reasonForOmission = $"`oModel is too large ({model.Info.FileSizeMb:N0} MB).";
                 return ModelMatchKind.DidntMatch;
             }
             if (model.Info.Runtime!.DeviceType is DeviceType.CPU && !AllowCpu)
             {
-                reasonForOmission = $"Model only runs on the CPU.";
+                reasonForOmission = $"`oModel only runs on the CPU.";
                 return ModelMatchKind.DidntMatch;
             }
             if (RegisteredEps.Count > 0 && !RegisteredEps.Contains(model.Info.Runtime!.ExecutionProvider))
             {
-                reasonForOmission = $"Model is not supported by any registered EP.";
+                reasonForOmission = $"`oModel is not supported by any registered EP.";
                 return ModelMatchKind.DidntMatch;
             }
 
@@ -191,10 +190,9 @@ namespace ToolCallingScratch
             Error
         }
 
-        record class Options(string ExeName, ProgramAction Action, ModelFilter Filter, bool ForceToolUse, int TimeoutInSeconds)
+        record class Options(string ExeName, ProgramAction Action, ModelFilter Filter, bool RequireToolUse, bool BruteForce, bool ShowVerbatimResponses, int TimeoutInSeconds)
         {
             internal const int DefaultTimeoutInSeconds = 60 * 1; // Time to wait for an answer. It's a trivial prompt...
-            internal const int DefaultMaxFileSize = 6 * 1_024; // 6 gigs; reasonable default for machines with 16 GB of RAM.
 
             internal static Options Parse(string[] args, out List<string> ignoredArgs)
             {
@@ -203,20 +201,27 @@ namespace ToolCallingScratch
                 List<string> localIgnoredArgs = [];
                 var exe = Path.GetFileNameWithoutExtension(Environment.ProcessPath)!;
                 bool allowCpu = false;
-                bool forceToolUse = false;
+                bool requireToolUse = false;
                 bool tryAllVariants = false;
+                bool bruteForce = false;
+                bool showVerbatimResponses = false;
                 int timeout = DefaultTimeoutInSeconds;
-                int maxSize = DefaultMaxFileSize;
+                int maxSize = ModelFilter.DefaultMaxFileSize;
                 List<string> requestedModels = [];
                 List<string> ignoredModels = [];
                 List<string> registeredEps = []; // will be filled out after loading.
                 ProgramAction action = ProgramAction.Help;
 
+                // Specifying nothing is the same as 'run' with no other args
                 if (args.Length == 0)
                 {
-                    return new(exe, action, ModelFilter.Default, forceToolUse, timeout);
+                    return new(exe, ProgramAction.Run, ModelFilter.Default, requireToolUse, bruteForce, showVerbatimResponses, timeout);
                 }
 
+                if (args[0].Equals("help", StringComparison.OrdinalIgnoreCase))
+                {
+                    return new(exe, ProgramAction.Help, ModelFilter.Default, requireToolUse, bruteForce, showVerbatimResponses, timeout);
+                }
                 if (args[0].Equals("list", StringComparison.OrdinalIgnoreCase))
                 {
                     action = ProgramAction.List;
@@ -228,7 +233,7 @@ namespace ToolCallingScratch
                 else
                 {
                     localIgnoredArgs.AddRange(args[1..]);
-                    return new(exe, action, ModelFilter.Default, forceToolUse, timeout);
+                    return new(exe, action, ModelFilter.Default, requireToolUse, bruteForce, showVerbatimResponses, timeout);
                 }
 
                 bool parseSuccess = true;
@@ -247,23 +252,31 @@ namespace ToolCallingScratch
                             break;
 
                         case "-f":
-                            forceToolUse = true;
+                            requireToolUse = true;
+                            break;
+
+                        case "-b":
+                            bruteForce = true;
+                            break;
+
+                        case "-r":
+                            showVerbatimResponses = true;
                             break;
 
                         case "-t":
                             parseSuccess = ParseArgParam("-t", s => timeout = int.Parse(s), "a time in seconds");
                             break;
 
-                        case "-a":
-                            parseSuccess = ParseArgParam("-a", s => requestedModels.Add(s), "a model alias");
+                        case "-m":
+                            parseSuccess = ParseArgParam("-m", requestedModels.Add, "a model alias");
                             break;
 
-                        case "-m":
-                            parseSuccess = ParseArgParam("-t", s => maxSize = int.Parse(s), "a file size in MB");
+                        case "-s":
+                            parseSuccess = ParseArgParam("-s", s => maxSize = int.Parse(s), "a file size in MB");
                             break;
 
                         case "-i":
-                            parseSuccess = ParseArgParam("-i", s => ignoredModels.Add(s), "a model name or alias to ignore");
+                            parseSuccess = ParseArgParam("-i", ignoredModels.Add, "a model name or alias to ignore");
                             break;
 
                         default:
@@ -280,7 +293,9 @@ namespace ToolCallingScratch
                 }
 
                 ignoredArgs = localIgnoredArgs;
-                return new(exe, action, new(requestedModels, maxSize, ignoredModels, tryAllVariants, registeredEps, allowCpu), forceToolUse, timeout);
+                return new(exe, action, 
+                    new(requestedModels, maxSize, ignoredModels, tryAllVariants, registeredEps, allowCpu),
+                    requireToolUse, bruteForce, showVerbatimResponses, timeout);
 
                 bool ParseArgParam(string param, Action<string> callback, string description)
                 {
@@ -322,12 +337,12 @@ namespace ToolCallingScratch
                 options.Filter!.RegisteredEps.AddRange(eps.RegisteredEps);
                 var catalog = await TimeActionAsync(() => instance.GetCatalogAsync(), "Getting model catalog");
                 WriteLine($"""
-                    `wArchitecture: {RuntimeInformation.ProcessArchitecture}.
-                    Registered EPs: {string.Join(", ", eps.RegisteredEps)}.
-                    Chosen model(s): {(options.Filter.SpecificModels.Count > 1 ? string.Join(", ", options.Filter.SpecificModels) : "all")}{(options.Filter.TryAllVariants ? " (with variants)" : "")}.
-                    Timeout (seconds): {options.TimeoutInSeconds}.
-                    Forcing tool usage: {options.ForceToolUse}.
-                    Max model size: {options.Filter.MaxSizeInMb}.
+                    `wArchitecture: `x{RuntimeInformation.ProcessArchitecture}.
+                    `wRegistered EPs: `x{string.Join(", ", eps.RegisteredEps)}.
+                    `wChosen model(s): `x{(options.Filter.SpecificModels.Count > 0 ? string.Join(", ", options.Filter.SpecificModels) : "`yall")}{(options.Filter.TryAllVariants ? " `y(with variants)" : "")}.
+                    `wTimeout (seconds): `x{options.TimeoutInSeconds}.
+                    `wForcing tool usage: `x{options.RequireToolUse}.
+                    `wMax model size: `x{options.Filter.MaxSizeInMb}.
                     """);
                 if (options.Filter.IgnoredModels.Count > 0)
                 {
@@ -363,25 +378,36 @@ namespace ToolCallingScratch
         static void Usage(string exe)
         {
             WriteLine($"""
-                `w
-                {exe} - Checks Foundry Local models for successful tool-calling ability.
+                
+                `w{exe}`x - Checks Foundry Local models for successful tool-calling ability.
 
-                Usage:
-                   1) {exe} list [options]  - lists models that match given filters.
-                   2) {exe} run [options]   - runs test for models that match the given filters.
-                   3) {exe} help            - this text.
+                `wUsage:
+                   `w{exe}`x `x     `x           `x- Same as '`y{exe} run`x'.
+                   `w{exe}`x `ylist `c[options]  `x- lists models that match given filters.
+                   `w{exe}`x `yrun `c[options]   `x- runs test for models that match the given filters.
+                   `w{exe}`x `yhelp `x           `x- this text.
 
-                Options (all are optional):
-                   -a <model>     Name or alias of a model to select (substring match). Can be specified more than once.
-                                  If choosing a specific name (not alias), you must include the '-v' option.
-                   -m <fileSize>  Maximum model file size allowed, in MB. Default is {Options.DefaultMaxFileSize}.
-                   -i <model>     Name or alias of a model to ignore (substring match). Can be specified more than once.
-                   -t <time>      Time, in seconds, to wait for the model to respond. Default is {Options.DefaultTimeoutInSeconds}.
-                   -f             Force tool calling (vs. leaving it as "auto").
-                   -c             Enable CPU-based models, if applicable for your hardware.
-                   -v             Include all variants for the selected model(s).
-                                        
-                Exit code is 0 for success, > 0 for an error.
+                `wOptions (all are optional):
+                   `c-m `g<model>     `xName or alias of a model to select (substring match). Can be specified more than once.
+                   `x   `x            `xIf choosing a specific name (not alias), you must include the '-v' option.
+                   `c-s `g<fileSize>  `xMaximum model file size allowed, in MB. Default is {ModelFilter.DefaultMaxFileSize}.
+                   `c-i `g<model>     `xName or alias of a model to ignore (substring match). Can be specified more than once.
+                   `c-t `g<time>      `xTime, in seconds, to wait for the model to respond. Default is {Options.DefaultTimeoutInSeconds}.
+                   `c-f `x            `xForce tool calling (vs. leaving it as "auto").
+                   `c-c `x            `xEnable CPU-based models, if applicable for your hardware.
+                   `c-v `x            `xInclude all variants for the selected model(s).
+                   `c-b `x            `xBrute-force tool-call attempts using basic pattern matching. Useful for some models.
+                   `c-r `x            `xShow verbatim responses from the models.
+
+                `wGrades:
+                   {GetGradeInColor(AverageTestGrade.A)} - Correct tool call; the only `wreal`x passing grade.
+                   {GetGradeInColor(AverageTestGrade.B)} - No explicit tool call, but can be brute-forced.
+                   {GetGradeInColor(AverageTestGrade.C)} - [Only used as an average; not an actual grade.]
+                   {GetGradeInColor(AverageTestGrade.D)} - [Only used as an average; not an actual grade.]
+                   {GetGradeInColor(AverageTestGrade.E)} - Attempt to make a tool call, but the name or parameters are incorrect.
+                   {GetGradeInColor(AverageTestGrade.F)} - No attempt to make a tool call, and couldn't brute-force it either.
+                                                        
+                `wExit code is 0 for success, > 0 for an error.
                 """);
         }
 
@@ -394,9 +420,7 @@ namespace ToolCallingScratch
                 if (filteredResult.MatchKind == ModelMatchKind.Matched)
                 {
                     var model = filteredResult.Model;
-                    Write($"`w{filteredResult.Model.Alias,30}");
-                    Write(GetDeviceTypeInColor(model));
-                    WriteLine($"`d {model.Info.Runtime!.ExecutionProvider,-25} [{model.Info.Name}]");
+                    WriteLine($"`w{filteredResult.Model.Alias,30} ({GetDeviceTypeInColor(model)}) `y{model.Info.Runtime!.ExecutionProvider,-25} `d[{model.Info.Name}]");
                     ++total;
                 }
 
@@ -407,16 +431,16 @@ namespace ToolCallingScratch
             return total > 0 ? ExitCode.Success : ExitCode.Fail;
         }
 
-        static async Task<ToolCallingResult> RunOneModelVariantAsync(Options options, ModelFilterResult filterResult)
+        static async Task<ToolCallingResults> RunOneModelVariantAsync(Options options, ModelFilterResult filterResult)
         {
-            var combinedResult = new ToolCallingResult(filterResult);
+            var combinedResult = new ToolCallingResults(filterResult);
             if (filterResult.MatchKind != ModelMatchKind.Matched)
             {
                 if (filterResult.MatchKind is ModelMatchKind.DidntMatch or ModelMatchKind.ExplicitlyIgnored)
                 {
                     WriteLine($"`cIgnoring {filterResult.Name}: {filterResult.ReasonForOmission}");
                 }
-                combinedResult.TestResults.Add(new(ToolCallingGrade.Ineligible, TimeSpan.FromSeconds(0)));
+                combinedResult.TestResults.Add(new(TestGrade.Ineligible, TimeSpan.FromSeconds(0)));
                 return combinedResult;
             }
 
@@ -428,7 +452,7 @@ namespace ToolCallingScratch
                 await TimeActionAsync(() => model.LoadAsync(), "Loading model");
                 var client = await TimeActionAsync(() => model.GetChatClientAsync(), "Getting chat client");
                 client.Settings.Temperature = 0f;
-                client.Settings.ToolChoice = options.ForceToolUse ? ToolChoice.Required : ToolChoice.Auto;
+                client.Settings.ToolChoice = options.RequireToolUse ? ToolChoice.Required : ToolChoice.Auto;
 
                 foreach (var test in AllTests)
                 {
@@ -439,7 +463,7 @@ namespace ToolCallingScratch
             catch (Exception ex)
             {
                 WriteLine($"`r{Environment.NewLine}ERROR: Cannot load model {filterResult.Name}:{Environment.NewLine}{GetExceptionMessage(ex)}");
-                combinedResult.TestResults.Add(new(ToolCallingGrade.F, TimeSpan.FromSeconds(0)));
+                combinedResult.TestResults.Add(new(TestGrade.F, TimeSpan.FromSeconds(0)));
             }
             finally
             {
@@ -451,10 +475,10 @@ namespace ToolCallingScratch
                 
                 Combined Results for {model.Info.Name}:
                 ===============
-                Best grade:    {combinedResult.TestResults.Min(x => x.Grade)}.
-                Average grade: {combinedResult.AverageGrade}.
-                Best time:     {combinedResult.TestResults.Min(x => x.TotalTime.TotalMilliseconds):N0}ms.
-                Average time:  {combinedResult.AverageTime.TotalMilliseconds:N0}ms.
+                `wBest grade:    {GetGradeInColor(combinedResult.TestResults.Min(x => x.Grade))}.
+                `wAverage grade: {GetGradeInColor(combinedResult.AverageGrade)}.
+                `wBest time:     `x{combinedResult.TestResults.Min(x => x.TotalTime.TotalMilliseconds):N0}ms.
+                `wAverage time:  `x{combinedResult.AverageTime.TotalMilliseconds:N0}ms.
 
                 """);
 
@@ -463,7 +487,7 @@ namespace ToolCallingScratch
 
         static async Task<ExitCode> RunAsync(Options options, ICatalog catalog)
         {
-            List<ToolCallingResult> results = [];
+            List<ToolCallingResults> results = [];
 
             await EnumerateAllCandidateModelsAsync(options, catalog,
                 async filterResult => results.Add((await RunOneModelVariantAsync(options, filterResult))));
@@ -489,27 +513,21 @@ namespace ToolCallingScratch
                 }
 
                 var model = result.FilterResult.Model;
-                Write($"`w{model.Alias,30}");
-                Write($"`w |   ");
-                Write(GetGradeInColor(result.AverageGrade));
-                Write($"`w   | ");
-                Write($"`w{result.AverageTime.TotalMilliseconds,9:N0}");
-                Write($"`w | ");
-                Write(GetDeviceTypeInColor(model));
-                Write($"`w | ");
-                WriteLine($"`d{model.Info.Runtime!.ExecutionProvider} [{model.Info.Name}]");
+                WriteLine($"`w{model.Alias,30}`w |   {GetGradeInColor(result.AverageGrade)}`w   | "
+                    + $"{result.AverageTime.TotalMilliseconds,9:N0} |   {GetDeviceTypeInColor(model)}`w  | "
+                    + $"`d{model.Info.Runtime!.ExecutionProvider} [{model.Info.Name}]");
             }
 
             WriteLine($"""
-                `wRan: {total - ignored};
-                Ignored: {ignored};
-                Total: {total};
+                `wRan: {total - ignored,2}
+                `xIgnored: {ignored,2};
+                `yTotal: `{total,2};
                 """);
 
             return ExitCode.Success;
         }
 
-        static bool IsCorrectFunctionCall(FunctionCall call, ModelTest test)
+        static bool IsExpectedFunctionCall(FunctionCall call, ModelTest test)
         {
             if (call.Name != test.ExpectedFunctionName)
             {
@@ -535,9 +553,9 @@ namespace ToolCallingScratch
             return true;
         }
 
-        static async Task<ToolCallingGrade> ExecutePromptAsync(Options options, OpenAIChatClient client, ModelTest test)
+        static async Task<TestGrade> ExecutePromptAsync(Options options, OpenAIChatClient client, ModelTest test)
         {
-            ToolCallingGrade exitCode = ToolCallingGrade.F;
+            TestGrade exitCode = TestGrade.F;
             List<ChatMessage> messages = [systemChatMessage];
             messages.Add(new("user", test.UserPrompt));
 
@@ -552,43 +570,49 @@ namespace ToolCallingScratch
                 var message = reply.Message;
                 var content = message.Content!;
 
-                WriteLine($"`aVerbatim response:{Environment.NewLine}---{Environment.NewLine}{message.Content}{Environment.NewLine}---");
+                if (options.ShowVerbatimResponses)
+                {
+                    WriteLine($"`aVerbatim response:{Environment.NewLine}---{Environment.NewLine}{message.Content}{Environment.NewLine}---");
+                }
 
                 if (reply.FinishReason == "tool_calls")
                 {
-                    if (IsCorrectFunctionCall(reply.Message.ToolCalls![0].FunctionCall!, test))
+                    if (IsExpectedFunctionCall(reply.Message.ToolCalls![0].FunctionCall!, test))
                     {
-                        WriteLine($"`gGRADE: A. Correct tool-call syntax with correct data.");
-                        exitCode = ToolCallingGrade.A;
+                        WriteLine($"GRADE: {GetGradeInColor(TestGrade.A)}");
+                        exitCode = TestGrade.A;
                     }
                     else
                     {
-                        WriteLine($"`rGRADE: E. Correct tool-call syntax, but incorrect data.");
-                        exitCode = ToolCallingGrade.E;
+                        WriteLine($"GRADE: {GetGradeInColor(TestGrade.E)}");
+                        exitCode = TestGrade.E;
                     }
                 }
                 // Try to brute-force it
-                else if (TryBruteForceFunctionCall(message.Content!, toolDefinitions, out var toolCall)
-                    && IsCorrectFunctionCall(toolCall, test))
+                else if (options.BruteForce && 
+                    TryBruteForceFunctionCall(message.Content!, toolDefinitions, out var toolCall)
+                    && IsExpectedFunctionCall(toolCall, test))
                 {
-                    WriteLine($"`oGRADE: B. Incorrect tool-call syntax, but it was brute-forced.");
-                    exitCode = ToolCallingGrade.B;
+                    WriteLine($"GRADE: {GetGradeInColor(TestGrade.B)}");
+                    exitCode = TestGrade.B;
                 }
                 else
                 {
-                    WriteLine($"`rGRADE: F. Did not detect a tool-call, and could not brute-force it.");
-                    exitCode = ToolCallingGrade.F;
+                    WriteLine($"GRADE: {GetGradeInColor(TestGrade.F)}");
+                    exitCode = TestGrade.F;
                 }
             }
             catch (TaskCanceledException)
             {
-                WriteLine($"`rGRADE F: Chat took longer than {options.TimeoutInSeconds} seconds to respond.");
-                exitCode = ToolCallingGrade.F;
+                WriteLine($"`rChat took longer than {options.TimeoutInSeconds} seconds to respond.");
+                WriteLine($"GRADE: {GetGradeInColor(TestGrade.F)}");
+                exitCode = TestGrade.F;
             }
             catch (Exception ex)
             {
-                WriteLine($"`rGRADE F: Runtime error.{Environment.NewLine}{GetExceptionMessage(ex)}");
-                exitCode = ToolCallingGrade.F;
+                WriteLine($"`rRuntime error.{Environment.NewLine}{GetExceptionMessage(ex)}");
+                WriteLine($"GRADE: {GetGradeInColor(TestGrade.F)}");
+                exitCode = TestGrade.F;
             }
 
             return exitCode;
@@ -624,26 +648,35 @@ namespace ToolCallingScratch
 
         static readonly Regex propertyValueRegex = new($"(?<string>{quotedStringRegEx})|(?<number>{numberRegEx})|(?<boolean>{boolRegEx})|(?<null>{nullRegEx})", RegexOptions.IgnoreCase);
 
-        // Tries to brute-force a function call from message content. For each ToolDefinition in 'tools',
-        // it does the following:
-        // 
-        // 1) Check for last occurence of its name (to skip over any prose like "I need to call...").
-        //    * If there is none, go to next tool.
-        //
-        // 2) Parse the rest of the string into the following tokens (all other chars are ignored):
-        //    * Identifier (typical C-style identifier, but also allows embedded periods).
-        //    * Quoted String (including the empty string and strings with escaped quotes).
-        //    * Boolean literal.
-        //    * Numeric literal (including floats).
-        //    * null literal.
-        //
-        // 3) Attempts to match the remaining tokens against the arguments defined by
-        //    the tool, in the form of <property-name> followed by <property-value>.
-        //    * Any string that isn't a valid argument name is ignored
-        //    * Only simple properties are supported (not arrays or nested objects).
-        //
-        // Arguments can be in any order, but this function assumes ALL defined parameters are required.
-        // TODO: Consider updating it to support 'optional' parameters.
+        /// <summary>
+        /// Tries to brute-force a function call from message content. It's based on a pedestrian 
+        /// parsing of the text for appropriate names / values in the right order. Explicitly does
+        /// not require JSON parsing, as many models return partial JSON, XML, or other formats.
+        /// </summary>
+        /// <param name="rawMessageContent">The raw content of the message.</param>
+        /// <param name="tools">The set of registered tools to check for.</param>
+        /// <param name="function">If successful, the detected function call.</param>
+        /// <returns>True if a function call was detected; otherwise false</returns>
+        /// <remarks>
+        /// For each ToolDefinition in 'tools', the parser does the following:
+        /// 
+        /// 1) Check for last occurence of its name (to skip over any prose like "I need to call...").
+        ///    * If there is none, go to next tool.
+        ///
+        /// 2) Parse the rest of the string into the following tokens (all other chars are ignored):
+        ///    * Identifier (typical C-style identifier, but also allows embedded periods).
+        ///    * Quoted String (including the empty string and strings with escaped quotes).
+        ///    * Boolean literal.
+        ///    * Numeric literal (including floats).
+        ///    * null literal.
+        ///
+        /// 3) Attempts to match the remaining tokens against the arguments defined by
+        ///    the tool, in the form of <property-name> followed by <property-value>.
+        ///    * Any string that isn't a valid argument name is ignored
+        ///    * Only simple properties are supported (not arrays or nested objects).
+        ///
+        /// Arguments can be in any order, but this function assumes ALL defined parameters are required.
+        /// </remarks>
         static bool TryBruteForceFunctionCall(string rawMessageContent, IEnumerable<ToolDefinition> tools, [NotNullWhen(true)] out FunctionCall? function)
         {
             function = null;
@@ -794,68 +827,79 @@ namespace ToolCallingScratch
         {
             return model.Info.Runtime!.DeviceType switch
             {
-                DeviceType.GPU => "`g (GPU)",
-                DeviceType.NPU => "`m (NPU)",
-                DeviceType.CPU => "`d (CPU)",
-                _ => "`r (Invalid)"
+                DeviceType.GPU => "`gGPU`x",
+                DeviceType.NPU => "`mNPU`x",
+                DeviceType.CPU => "`dCPU`x",
+                _ => "`rInvalid`x"
             };
         }
 
-        static string GetGradeInColor(AverageToolCallingGrade grade) => GetGradeInColor((int)grade);
-        static string GetGradeInColor(ToolCallingGrade grade) => GetGradeInColor((int)grade);
+        static string GetGradeInColor(AverageTestGrade grade) => GetGradeInColor((int)grade);
+        static string GetGradeInColor(TestGrade grade) => GetGradeInColor((int)grade);
         static string GetGradeInColor(int value)
         {
             return value switch
             {
-                0 => "`gA",
-                1 => "`yB",
-                2 => "`oC",
-                3 => "`rD",
-                4 => "`rE",
-                5 => "`rF",
-                _ => "`b-"
+                0 => "`gA`x",
+                1 => "`yB`x",
+                2 => "`oC`x",
+                3 => "`rD`x",
+                4 => "`rE`x",
+                5 => "`rF`x",
+                _ => "`b-`x"
             };
         }
 
         static void ShowModelInfo(IModel model)
         {
-            Write($"""
-                `y{new string('-', 50)}
-                Alias: {model.Alias}, Full Name: {model.Info.Name}, Size: {model.Info.FileSizeMb:N0} MB.
-                EP: {model.Info.Runtime!.ExecutionProvider} 
+            WriteLine($"""
+                
+                `w{new string('-', 50)}
+                `wAlias: `x{model.Alias}, `wDevice: {GetDeviceTypeInColor(model)}, `wSize: `x{model.Info.FileSizeMb:N0} MB, `wFull Name: `x{model.Info.Name}, `wEP: `x{model.Info.Runtime!.ExecutionProvider}
                 """);
-            WriteLine($"{GetDeviceTypeInColor(model)}.");
         }
 
         static void WriteLine(string content) => Write(content + Environment.NewLine);
 
         static void Write(string content)
         {
-            char color = ' ';
-
-            // Content can begin with "`x" where x is a color.
-            if (content is ['`', char c, .. var rest])
+            int totalLength = content.Length;
+            for (int i = 0; i < content.Length; ++i)
             {
-                color = c;
-                content = rest;
+                var c = content[i];
+                if (c != '`' || i == (totalLength - 1))
+                {
+                    Console.Write(c);
+                    continue;
+                }
+
+                // Check for markdown '```' and ignore it (models often return this)
+                if (i < (totalLength - 2) && content[i + 1] == '`' && content[i + 2] == '`')
+                {
+                    Console.Write("```");
+                    i += 2;
+                    continue;
+                }
+
+                // must be ` followed by a char
+                var color = content[++i] switch
+                {
+                    'r' => ConsoleColor.Red,
+                    'g' => ConsoleColor.Green,
+                    'b' => ConsoleColor.Blue,
+                    'y' => ConsoleColor.Yellow,
+                    'n' => ConsoleColor.DarkGreen,
+                    'o' => ConsoleColor.DarkYellow,
+                    'm' => ConsoleColor.Magenta,
+                    'c' => ConsoleColor.Cyan,
+                    'd' => ConsoleColor.DarkGray,
+                    'w' => ConsoleColor.White,
+                    _ => ConsoleColor.Gray
+                };
+
+                Console.ForegroundColor = color;
             }
 
-            Console.ForegroundColor = color switch
-            {
-                'r' => ConsoleColor.Red,
-                'g' => ConsoleColor.Green,
-                'b' => ConsoleColor.Blue,
-                'y' => ConsoleColor.Yellow,
-                'n' => ConsoleColor.DarkGreen,
-                'o' => ConsoleColor.DarkYellow,
-                'm' => ConsoleColor.Magenta,
-                'c' => ConsoleColor.Cyan,
-                'd' => ConsoleColor.DarkGray,
-                'w' => ConsoleColor.White,
-                _ => ConsoleColor.Gray
-            };
-
-            Console.Write(content);
             Console.ResetColor();
         }
 

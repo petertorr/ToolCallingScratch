@@ -10,7 +10,7 @@
     },
     "all variants": {
       "commandName": "Project",
-      "commandLineArgs": "allvariants",
+      "commandLineArgs": "run -m qwen -v",
       "hotReloadEnabled": true,
       "debugEngines": "managed,native"
     }
