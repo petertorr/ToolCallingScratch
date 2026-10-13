@@ -137,20 +137,21 @@ namespace ToolCallingScratch
         Error
     }
 
-    record class Options(string ExeName, ProgramAction Action, ModelFilter Filter, bool RequireToolUse, bool BruteForce, 
-        bool ShowVerbatimResponses, bool QuietMode, int TimeoutInSeconds)
+    record class Options(ProgramAction Action, ModelFilter Filter, bool RequireToolUse, bool BruteForce, bool ShowVerbatimResponses,
+        bool QuietMode, int TimeoutInSeconds)
     {
         internal const int DefaultTimeoutInSeconds = 60 * 1; // Time to wait for an answer. It's a trivial prompt...
 
-        static Options MakeDefault(string exeName, ProgramAction action) => new(exeName, action, ModelFilter.Default,
-            false, false, false, false, DefaultTimeoutInSeconds);
+        static Options MakeDefault(ProgramAction action) => new(action, ModelFilter.Default, false,
+            false, false, false, DefaultTimeoutInSeconds);
+
+        internal static Options DefaultBeforeParsing { get; } = MakeDefault(ProgramAction.Help);
 
         internal static Options Parse(string[] args, out List<string> ignoredArgs)
         {
             int index = 0;
             ignoredArgs = [];
             List<string> localIgnoredArgs = [];
-            var exe = Path.GetFileNameWithoutExtension(Environment.ProcessPath)!;
             bool allowCpu = false;
             bool requireToolUse = false;
             bool tryAllVariants = false;
@@ -168,7 +169,7 @@ namespace ToolCallingScratch
             // Specifying nothing is the same as 'run' with no other args
             if (args.Length == 0)
             {
-                return MakeDefault(exe, ProgramAction.Run);
+                return MakeDefault(ProgramAction.Run);
             }
             if (args[0].Equals("list", StringComparison.OrdinalIgnoreCase))
             {
@@ -180,7 +181,7 @@ namespace ToolCallingScratch
             }
             else
             {
-                return MakeDefault(exe, ProgramAction.Help);
+                return MakeDefault(ProgramAction.Help);
             }
 
             bool parseSuccess = true;
@@ -248,9 +249,9 @@ namespace ToolCallingScratch
             }
 
             ignoredArgs = localIgnoredArgs;
-            return new(exe, action,
-                new(requestedModels, maxSize, ignoredModels, tryAllVariants, ignoreToolSupport, registeredEps, allowCpu),
-                requireToolUse, bruteForce, showVerbatimResponses, quietMode, timeout);
+            return new(action, new(requestedModels, maxSize, ignoredModels, tryAllVariants, ignoreToolSupport, registeredEps, allowCpu),
+                requireToolUse,
+                bruteForce, showVerbatimResponses, quietMode, timeout);
 
             bool ParseArgParam(string param, Action<string> callback, string description)
             {
@@ -295,7 +296,7 @@ namespace ToolCallingScratch
                 .AddParameter("overwrite", PropertyDefinition.DefineBoolean("Whether or not to overwrite an existing file."), true)
                 .Build()
             ),
-            ];
+        ];
 
         static readonly ToolCallingTestMetadata WeatherTest = new("What is the weather in Seattle?", "getWeather", new()
         {
@@ -320,18 +321,30 @@ namespace ToolCallingScratch
 
         const int maxErrorMessageLength = 500; // Truncate error messages longer than this.
 
-        static Options options = null!;
+        static Options options = Options.DefaultBeforeParsing;
+
+        static readonly string exeName = Path.GetFileNameWithoutExtension(Environment.ProcessPath)!;
 
         static async Task<int> Main(string[] args)
         {
+            WriteLine($"`w{exeName} ({RuntimeInformation.ProcessArchitecture})", true);
+
             options = Options.Parse(args, out var ignoredArgs);
 
-            WriteLine($"`w{options.ExeName} ({RuntimeInformation.ProcessArchitecture}).", true);
-
-            if (options.Action is ProgramAction.Help or ProgramAction.Error)
+            if (options.Action is ProgramAction.Help)
             {
-                Usage(options.ExeName);
+                Usage();
                 return (int)ExitCode.Other;
+            }
+            if (options.Action is ProgramAction.Error)
+            {
+                WriteLine($"Use `y{exeName} help`x for help.", true);
+                return (int)ExitCode.Other;
+            }
+
+            if (options.QuietMode)
+            {
+                WriteLine($"`yQuiet Mode; app may appear to hang for several minutes...", true);
             }
 
             if (ignoredArgs.Count > 0)
@@ -376,27 +389,27 @@ namespace ToolCallingScratch
             catch (Exception ex)
             {
                 WriteLine($"`r{Environment.NewLine}ERROR: {ex.Message}", true);
-                Usage(options.ExeName);
+                Usage();
                 return (int)ExitCode.Other;
             }
             finally
             {
-                WriteLine($"`d[Total time: {sw.Elapsed.TotalSeconds:N2} seconds]",true);
+                WriteLine($"`d[Total time: {sw.Elapsed.TotalSeconds:N2} seconds]", true);
             }
         }
 
-        static void Usage(string exe)
+        static void Usage()
         {
             WriteLine($"""
                 
-                `w{exe}`x - Checks Foundry Local models for successful tool-calling ability.
+                `w{exeName}`x - Checks Foundry Local models for successful tool-calling ability.
 
                 `wUsage
                 `w=====
-                   `w{exe}`x `x     `x           `x- Same as '`y{exe} run`x'.
-                   `w{exe}`x `ylist `c[options]  `x- lists models that match given filters.
-                   `w{exe}`x `yrun `c[options]   `x- runs test for models that match the given filters.
-                   `w{exe}`x `yhelp `x           `x- this text.
+                   `w{exeName}`x `x     `x           `x- Same as '`y{exeName} run`x'.
+                   `w{exeName}`x `ylist `c[options]  `x- lists models that match given filters.
+                   `w{exeName}`x `yrun `c[options]   `x- runs test for models that match the given filters.
+                   `w{exeName}`x `yhelp `x           `x- this text.
 
                 `wOptions (all are optional)
 
@@ -425,7 +438,7 @@ namespace ToolCallingScratch
                    {GetGradeInColor(AverageTestGrade.F)} - No attempt to make a tool call, and couldn't brute-force it either.
                                                         
                 `wExit code is 0 for success, > 0 for an error.
-                """,true);
+                """, true);
         }
 
         static async Task<ExitCode> ListAsync(ICatalog catalog)
