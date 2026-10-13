@@ -55,12 +55,12 @@ namespace ToolCallingScratch
         ExplicitlyIgnored
     }
 
-    record class ModelFilter(List<string> SpecificModels, int MaxSizeInMb, List<string> IgnoredModels, bool TryAllVariants, List<string> RegisteredEps, bool AllowCpu)
+    record class ModelFilter(List<string> SpecificModels, int MaxSizeInMb, List<string> IgnoredModels, bool TryAllVariants, bool IgnoreToolsSupport, List<string> RegisteredEps, bool AllowCpu)
     {
         internal record class MatchInfo(string Name, IModel Model, ModelMatchKind MatchKind, string? ReasonForOmission);
         internal const int DefaultMaxFileSize = 6 * 1_024; // 6 gigs; reasonable default for machines with 16 GB of RAM.
 
-        internal static ModelFilter Default { get; } = new([], DefaultMaxFileSize, [], false, [], false);
+        internal static ModelFilter Default { get; } = new([], DefaultMaxFileSize, [], false, false, [], false);
 
         internal List<MatchInfo> GetAllMatches(IEnumerable<IModel> models)
         {
@@ -104,7 +104,7 @@ namespace ToolCallingScratch
                 reasonForOmission = $"`oModel is explicitly ignored.";
                 return ModelMatchKind.ExplicitlyIgnored;
             }
-            if (!model.Info.SupportsToolCalling.HasValue || model.Info.SupportsToolCalling.Value == false)
+            if (!IgnoreToolsSupport && (!model.Info.SupportsToolCalling.HasValue || model.Info.SupportsToolCalling.Value == false))
             {
                 reasonForOmission = $"`oModel doesn't support tool-calling.";
                 return ModelMatchKind.DidntMatch;
@@ -137,9 +137,13 @@ namespace ToolCallingScratch
         Error
     }
 
-    record class Options(string ExeName, ProgramAction Action, ModelFilter Filter, bool RequireToolUse, bool BruteForce, bool ShowVerbatimResponses, int TimeoutInSeconds)
+    record class Options(string ExeName, ProgramAction Action, ModelFilter Filter, bool RequireToolUse, bool BruteForce, 
+        bool ShowVerbatimResponses, bool QuietMode, int TimeoutInSeconds)
     {
         internal const int DefaultTimeoutInSeconds = 60 * 1; // Time to wait for an answer. It's a trivial prompt...
+
+        static Options MakeDefault(string exeName, ProgramAction action) => new(exeName, action, ModelFilter.Default,
+            false, false, false, false, DefaultTimeoutInSeconds);
 
         internal static Options Parse(string[] args, out List<string> ignoredArgs)
         {
@@ -152,6 +156,8 @@ namespace ToolCallingScratch
             bool tryAllVariants = false;
             bool bruteForce = false;
             bool showVerbatimResponses = false;
+            bool quietMode = false;
+            bool ignoreToolSupport = false;
             int timeout = DefaultTimeoutInSeconds;
             int maxSize = ModelFilter.DefaultMaxFileSize;
             List<string> requestedModels = [];
@@ -162,12 +168,7 @@ namespace ToolCallingScratch
             // Specifying nothing is the same as 'run' with no other args
             if (args.Length == 0)
             {
-                return new(exe, ProgramAction.Run, ModelFilter.Default, requireToolUse, bruteForce, showVerbatimResponses, timeout);
-            }
-
-            if (args[0].Equals("help", StringComparison.OrdinalIgnoreCase))
-            {
-                return new(exe, ProgramAction.Help, ModelFilter.Default, requireToolUse, bruteForce, showVerbatimResponses, timeout);
+                return MakeDefault(exe, ProgramAction.Run);
             }
             if (args[0].Equals("list", StringComparison.OrdinalIgnoreCase))
             {
@@ -179,8 +180,7 @@ namespace ToolCallingScratch
             }
             else
             {
-                localIgnoredArgs.AddRange(args[1..]);
-                return new(exe, action, ModelFilter.Default, requireToolUse, bruteForce, showVerbatimResponses, timeout);
+                return MakeDefault(exe, ProgramAction.Help);
             }
 
             bool parseSuccess = true;
@@ -210,6 +210,14 @@ namespace ToolCallingScratch
                         showVerbatimResponses = true;
                         break;
 
+                    case "-a":
+                        ignoreToolSupport = true;
+                        break;
+
+                    case "-q":
+                        quietMode = true;
+                        break;
+
                     case "-t":
                         parseSuccess = ParseArgParam("-t", s => timeout = int.Parse(s), "a time in seconds");
                         break;
@@ -227,7 +235,7 @@ namespace ToolCallingScratch
                         break;
 
                     default:
-                        Program.WriteLine($"`r{args[index]} option not recognized.");
+                        Program.WriteLine($"`r{args[index]} option not recognized.", true);
                         localIgnoredArgs.Add(args[index]);
                         break;
                 }
@@ -241,8 +249,8 @@ namespace ToolCallingScratch
 
             ignoredArgs = localIgnoredArgs;
             return new(exe, action,
-                new(requestedModels, maxSize, ignoredModels, tryAllVariants, registeredEps, allowCpu),
-                requireToolUse, bruteForce, showVerbatimResponses, timeout);
+                new(requestedModels, maxSize, ignoredModels, tryAllVariants, ignoreToolSupport, registeredEps, allowCpu),
+                requireToolUse, bruteForce, showVerbatimResponses, quietMode, timeout);
 
             bool ParseArgParam(string param, Action<string> callback, string description)
             {
@@ -253,7 +261,7 @@ namespace ToolCallingScratch
                     return true;
                 }
 
-                Program.WriteLine($"`r{param} option needs {description}.");
+                Program.WriteLine($"`r{param} option needs {description}.", true);
                 localIgnoredArgs.Add(args[index]);
                 return false;
             }
@@ -312,9 +320,13 @@ namespace ToolCallingScratch
 
         const int maxErrorMessageLength = 500; // Truncate error messages longer than this.
 
+        static Options options = null!;
+
         static async Task<int> Main(string[] args)
         {
-            var options = Options.Parse(args, out var ignoredArgs);
+            options = Options.Parse(args, out var ignoredArgs);
+
+            WriteLine($"`w{options.ExeName} ({RuntimeInformation.ProcessArchitecture}).", true);
 
             if (options.Action is ProgramAction.Help or ProgramAction.Error)
             {
@@ -336,7 +348,6 @@ namespace ToolCallingScratch
                 options.Filter!.RegisteredEps.AddRange(eps.RegisteredEps);
                 var catalog = await TimeActionAsync(() => instance.GetCatalogAsync(), "Getting model catalog");
                 WriteLine($"""
-                    `wArchitecture: `x{RuntimeInformation.ProcessArchitecture}.
                     `wRegistered EPs: `x{string.Join(", ", eps.RegisteredEps)}.
                     `wChosen model(s): `x{(options.Filter.SpecificModels.Count > 0 ? string.Join(", ", options.Filter.SpecificModels) : "`yall")}{(options.Filter.TryAllVariants ? " `y(with variants)" : "")}.
                     `wTimeout (seconds): `x{options.TimeoutInSeconds}.
@@ -353,24 +364,24 @@ namespace ToolCallingScratch
                 }
                 if (options.Action == ProgramAction.List)
                 {
-                    return (int)await ListAsync(options, catalog);
+                    return (int)await ListAsync(catalog);
                 }
                 if (options.Action == ProgramAction.Run)
                 {
-                    return (int)await RunAsync(options, catalog);
+                    return (int)await RunAsync(catalog);
                 }
 
                 throw (new NotImplementedException("Don't know what to do"));
             }
             catch (Exception ex)
             {
-                WriteLine($"`r{Environment.NewLine}ERROR: {ex.Message}");
+                WriteLine($"`r{Environment.NewLine}ERROR: {ex.Message}", true);
                 Usage(options.ExeName);
                 return (int)ExitCode.Other;
             }
             finally
             {
-                WriteLine($"`d[Total time: {sw.Elapsed.TotalSeconds:N2} seconds]");
+                WriteLine($"`d[Total time: {sw.Elapsed.TotalSeconds:N2} seconds]",true);
             }
         }
 
@@ -380,25 +391,32 @@ namespace ToolCallingScratch
                 
                 `w{exe}`x - Checks Foundry Local models for successful tool-calling ability.
 
-                `wUsage:
+                `wUsage
+                `w=====
                    `w{exe}`x `x     `x           `x- Same as '`y{exe} run`x'.
                    `w{exe}`x `ylist `c[options]  `x- lists models that match given filters.
                    `w{exe}`x `yrun `c[options]   `x- runs test for models that match the given filters.
                    `w{exe}`x `yhelp `x           `x- this text.
 
-                `wOptions (all are optional):
-                   `c-m `g<model>     `xName or alias of a model to select (substring match). Can be specified more than once.
-                   `x   `x            `xIf choosing a specific name (not alias), you must include the '-v' option.
-                   `c-s `g<fileSize>  `xMaximum model file size allowed, in MB. Default is {ModelFilter.DefaultMaxFileSize}.
-                   `c-i `g<model>     `xName or alias of a model to ignore (substring match). Can be specified more than once.
-                   `c-t `g<time>      `xTime, in seconds, to wait for the model to respond. Default is {Options.DefaultTimeoutInSeconds}.
-                   `c-f `x            `xForce tool calling (vs. leaving it as "auto").
-                   `c-c `x            `xEnable CPU-based models, if applicable for your hardware.
-                   `c-v `x            `xInclude all variants for the selected model(s).
-                   `c-b `x            `xBrute-force tool-call attempts using basic pattern matching. Useful for some models.
-                   `c-r `x            `xShow verbatim responses from the models.
+                `wOptions (all are optional)
 
-                `wGrades:
+                   `c-m`b <model>     `xName or alias of a model to select (substring match). Can be specified more than once.
+                   `x  `x             `xIf choosing a specific name (not alias), you must include the '-v' option.
+                   `c-s`b <fileSize>  `xMaximum model file size allowed, in MB. Default is {ModelFilter.DefaultMaxFileSize}.
+                   `c-i`b <model>     `xName or alias of a model to ignore (substring match). Can be specified more than once.
+                   `c-c`x             `xEnable CPU-based models, if applicable for your hardware.
+                   `c-v`x             `xInclude all variants for the selected model(s).
+                   `c-a`x             `xTry all applicable models, even if they don't claim to support tool-calling.
+                
+                   `c-f`x             `xForce tool calling (vs. leaving it as "auto").
+                   `c-b`x             `xBrute-force tool-call attempts using basic pattern matching. Useful for some models.
+                   `c-t`b <time>      `xTime, in seconds, to wait for the model to respond. Default is {Options.DefaultTimeoutInSeconds}.
+                
+                   `c-r`x             `xShow verbatim responses from the models (sometimes good for a laugh).
+                   `c-q`x             `xQuiet mode; suppresses most of the app's output. May appear to hang while it's working.
+                
+                `wGrades
+                `w======
                    {GetGradeInColor(AverageTestGrade.A)} - Correct tool call; the only `wreal`x passing grade.
                    {GetGradeInColor(AverageTestGrade.B)} - No explicit tool call, but can be brute-forced.
                    {GetGradeInColor(AverageTestGrade.C)} - [Only used as an average; not an actual grade.]
@@ -407,19 +425,19 @@ namespace ToolCallingScratch
                    {GetGradeInColor(AverageTestGrade.F)} - No attempt to make a tool call, and couldn't brute-force it either.
                                                         
                 `wExit code is 0 for success, > 0 for an error.
-                """);
+                """,true);
         }
 
-        static async Task<ExitCode> ListAsync(Options options, ICatalog catalog)
+        static async Task<ExitCode> ListAsync(ICatalog catalog)
         {
             int total = 0;
             WriteLine($"`yListing models for this device that match your criteria.{Environment.NewLine}");
-            await EnumerateAllCandidateModelsAsync(options, catalog, filteredResult =>
+            await EnumerateAllCandidateModelsAsync(catalog, filteredResult =>
             {
                 if (filteredResult.MatchKind == ModelMatchKind.Matched)
                 {
                     var model = filteredResult.Model;
-                    WriteLine($"`w{filteredResult.Model.Alias,30} ({GetDeviceTypeInColor(model)}) `y{model.Info.Runtime!.ExecutionProvider,-25} `d[{model.Info.Name}]");
+                    WriteLine($"`w{filteredResult.Model.Alias,30} ({GetDeviceTypeInColor(model)}) `y{model.Info.Runtime!.ExecutionProvider,-25} `d[{model.Info.Name}]", true);
                     ++total;
                 }
 
@@ -430,7 +448,7 @@ namespace ToolCallingScratch
             return total > 0 ? ExitCode.Success : ExitCode.Fail;
         }
 
-        static async Task<TestSuiteResults> RunOneModelVariantAsync(Options options, ModelFilter.MatchInfo filterResult)
+        static async Task<TestSuiteResults> RunOneModelVariantAsync(ModelFilter.MatchInfo filterResult)
         {
             var combinedResult = new TestSuiteResults(filterResult);
             if (filterResult.MatchKind != ModelMatchKind.Matched)
@@ -455,7 +473,7 @@ namespace ToolCallingScratch
 
                 foreach (var test in AllTests)
                 {
-                    var execResult = await TimeActionAsync(() => ExecutePromptAsync(options, client, test));
+                    var execResult = await TimeActionAsync(() => ExecutePromptAsync(client, test));
                     combinedResult.TestResults.Add(new(execResult.Value, execResult.Elapsed));
                 }
             }
@@ -473,7 +491,7 @@ namespace ToolCallingScratch
                 `w
                 
                 Combined Results for {model.Info.Name}:
-                ===============
+                =================================
                 `wBest grade:    {GetGradeInColor(combinedResult.TestResults.Min(x => x.Grade))}.
                 `wAverage grade: {GetGradeInColor(combinedResult.AverageGrade)}.
                 `wBest time:     `x{combinedResult.TestResults.Min(x => x.TotalTime.TotalMilliseconds):N0}ms.
@@ -484,18 +502,17 @@ namespace ToolCallingScratch
             return combinedResult;
         }
 
-        static async Task<ExitCode> RunAsync(Options options, ICatalog catalog)
+        static async Task<ExitCode> RunAsync(ICatalog catalog)
         {
             List<TestSuiteResults> results = [];
 
-            await EnumerateAllCandidateModelsAsync(options, catalog,
-                async filterResult => results.Add((await RunOneModelVariantAsync(options, filterResult))));
+            await EnumerateAllCandidateModelsAsync(catalog, async filterResult => results.Add((await RunOneModelVariantAsync(filterResult))));
 
             int total = 0;
             int ignored = 0;
 
-            WriteLine($"`w{"",30} |  Avg  |    Avg    |        |");
-            WriteLine($"`w{"Alias",30} | Grade | {"Time (ms)",9} | Device | EP [name] ");
+            WriteLine($"`w{"",30} |  Avg  |    Avg    |        |", true);
+            WriteLine($"`w{"Alias",30} | Grade | {"Time (ms)",9} | Device | EP [name] ", true);
 
             foreach (var result in results)
             {
@@ -514,7 +531,7 @@ namespace ToolCallingScratch
                 var model = result.FilterResult.Model;
                 WriteLine($"`w{model.Alias,30}`w |   {GetGradeInColor(result.AverageGrade)}`w   | "
                     + $"{result.AverageTime.TotalMilliseconds,9:N0} |   {GetDeviceTypeInColor(model)}`w  | "
-                    + $"`d{model.Info.Runtime!.ExecutionProvider} [{model.Info.Name}]");
+                    + $"`d{model.Info.Runtime!.ExecutionProvider} [{model.Info.Name}]", true);
             }
 
             WriteLine($"""
@@ -552,7 +569,7 @@ namespace ToolCallingScratch
             return true;
         }
 
-        static async Task<TestGrade> ExecutePromptAsync(Options options, OpenAIChatClient client, ToolCallingTestMetadata test)
+        static async Task<TestGrade> ExecutePromptAsync(OpenAIChatClient client, ToolCallingTestMetadata test)
         {
             TestGrade exitCode = TestGrade.F;
             List<ChatMessage> messages = [systemChatMessage];
@@ -617,13 +634,13 @@ namespace ToolCallingScratch
             return exitCode;
         }
 
-        static async Task EnumerateAllCandidateModelsAsync(Options options, ICatalog catalog, Func<ModelFilter.MatchInfo, Task> callback)
+        static async Task EnumerateAllCandidateModelsAsync(ICatalog catalog, Func<ModelFilter.MatchInfo, Task> callback)
         {
             var models = await TimeActionAsync(() => catalog.ListModelsAsync(), "Getting list of models");
-            await EnumerateAllCandidateModelsAsync(options, models, callback);
+            await EnumerateAllCandidateModelsAsync(models, callback);
         }
 
-        static async Task EnumerateAllCandidateModelsAsync(Options options, IEnumerable<IModel> models, Func<ModelFilter.MatchInfo, Task> callback)
+        static async Task EnumerateAllCandidateModelsAsync(IEnumerable<IModel> models, Func<ModelFilter.MatchInfo, Task> callback)
         {
             var filtered = options.Filter.GetAllMatches(models);
 
@@ -663,16 +680,21 @@ namespace ToolCallingScratch
         static void ShowModelInfo(IModel model)
         {
             WriteLine($"""
-                
-                `w{new string('-', 10)}
-                `wAlias: `x{model.Alias}, `wDevice: {GetDeviceTypeInColor(model)}, `wSize: `x{model.Info.FileSizeMb:N0} MB, `wFull Name: `x{model.Info.Name}, `wEP: `x{model.Info.Runtime!.ExecutionProvider}
+                `yAlias: `x{model.Alias}, `wDevice: {GetDeviceTypeInColor(model)}, `wSize: `x{model.Info.FileSizeMb:N0} MB, `wFull Name: `x{model.Info.Name}, `wEP: `x{model.Info.Runtime!.ExecutionProvider}
                 """);
         }
 
-        internal static void WriteLine(string content) => Write(content + Environment.NewLine);
+        internal static void WriteLine(string content) => WriteLine(content + Environment.NewLine, false);
+        internal static void WriteLine(string content, bool bypassQuietMode) => Write(content + Environment.NewLine, bypassQuietMode);
 
-        internal static void Write(string content)
+        internal static void Write(string content) => Write(content, false);
+        internal static void Write(string content, bool bypassQuietMode)
         {
+            if (options.QuietMode && !bypassQuietMode)
+            {
+                return;
+            }
+
             int totalLength = content.Length;
             for (int i = 0; i < content.Length; ++i)
             {
