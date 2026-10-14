@@ -9,9 +9,9 @@ namespace ToolCallingScratch
     {
 static async Task<int> Main(string[] args)
 {
-    Console.WriteLine("Initializing... might take a few minutes.");
     string modelName = args.FirstOrDefault() ?? "phi-4-mini-reasoning";
-    const int timeout = 3;
+
+    Console.WriteLine("Initializing... might take a few minutes.");
     await FoundryLocalManager.CreateAsync(new() { AppName = "ToolCallingScratch" }, NullLogger.Instance);
     using var instance = FoundryLocalManager.Instance;
     var eps = await instance.DownloadAndRegisterEpsAsync();
@@ -25,9 +25,9 @@ static async Task<int> Main(string[] args)
     Console.WriteLine($"Failed EPs: {string.Join(", ", eps.FailedEps)}.");
     Console.WriteLine($"Model full name: {model.Id}");
 
-    var ct = new CancellationTokenSource(TimeSpan.FromSeconds(3));
-    ct.Token.Register(() => Console.WriteLine($"{Environment.NewLine}TIMEOUT"));
-
+    const int timeout = 3;
+    var ct = new CancellationTokenSource(TimeSpan.FromSeconds(timeout));
+    ct.Token.Register(async () => Console.WriteLine($"{Environment.NewLine}TIMEOUT!"));
 
     var sw = Stopwatch.StartNew();
     var reply = (await client.CompleteChatAsync(messages, null, ct.Token)).Choices[0];
