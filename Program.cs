@@ -6,6 +6,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.InteropServices;
+using ToolCallingScratch.CrashDetection;
 
 namespace ToolCallingScratch
 {
@@ -327,6 +328,8 @@ namespace ToolCallingScratch
 
         static async Task<int> Main(string[] args)
         {
+            NativeExceptionHelper.SetupExceptionHandling();
+
             WriteLine($"`w{exeName} ({RuntimeInformation.ProcessArchitecture})", true);
 
             options = Options.Parse(args, out var ignoredArgs);
@@ -375,6 +378,7 @@ namespace ToolCallingScratch
                 {
                     WriteLine($"`rFailed EPs: {string.Join(", ", eps.FailedEps)}.");
                 }
+
                 if (options.Action == ProgramAction.List)
                 {
                     return (int)await ListAsync(catalog);
@@ -479,11 +483,13 @@ namespace ToolCallingScratch
             try
             {
                 await TimeActionAsync(() => model.DownloadAsync(), "Downloading model");
+                NativeExceptionHelper.CurrentModelName = model.Info.Name;
+                NativeExceptionHelper.IsLoadingModel = true;
                 await TimeActionAsync(() => model.LoadAsync(), "Loading model");
+                NativeExceptionHelper.IsLoadingModel = false;
                 var client = await TimeActionAsync(() => model.GetChatClientAsync(), "Getting chat client");
                 client.Settings.Temperature = 0f;
                 client.Settings.ToolChoice = options.RequireToolUse ? ToolChoice.Required : ToolChoice.Auto;
-
                 foreach (var test in AllTests)
                 {
                     var execResult = await TimeActionAsync(() => ExecutePromptAsync(client, test));
@@ -590,11 +596,21 @@ namespace ToolCallingScratch
 
             try
             {
+                bool didComplete = false;
+                var cancellationToken = new CancellationTokenSource(TimeSpan.FromSeconds(options.TimeoutInSeconds)).Token;
+                cancellationToken.Register(x =>
+                {
+                    if (!didComplete)
+                    {
+                        WriteLine($"`r[TIMEOUT EXCEEDED].");
+                    }
+                }, null, false);
+
                 var response = await TimeActionAsync(() => client.CompleteChatAsync(
-                    messages, toolDefinitions,
-                    new CancellationTokenSource(TimeSpan.FromSeconds(options.TimeoutInSeconds)).Token),
+                    messages, toolDefinitions, cancellationToken),
                     $"Sending prompt '{test.UserPrompt}'");
 
+                didComplete = true;
                 var reply = response.Choices[0]!;
                 var message = reply.Message;
                 var content = message.Content!;
@@ -673,7 +689,6 @@ namespace ToolCallingScratch
                 _ => "`rInvalid`x"
             };
         }
-
         static string GetGradeInColor(AverageTestGrade grade) => GetGradeInColor((int)grade);
         static string GetGradeInColor(TestGrade grade) => GetGradeInColor((int)grade);
         static string GetGradeInColor(int value)
@@ -697,7 +712,7 @@ namespace ToolCallingScratch
                 """);
         }
 
-        internal static void WriteLine(string content) => WriteLine(content + Environment.NewLine, false);
+        internal static void WriteLine(string content) => WriteLine(content, false);
         internal static void WriteLine(string content, bool bypassQuietMode) => Write(content + Environment.NewLine, bypassQuietMode);
 
         internal static void Write(string content) => Write(content, false);
@@ -775,10 +790,16 @@ namespace ToolCallingScratch
         {
             Write($"`d{description}...");
             var sw = Stopwatch.StartNew();
-            var t = await f();
-            sw.Stop();
-            WriteLine($"`d it took {sw.ElapsedMilliseconds:N0} ms");
-            return t;
+            try
+            {
+                var t = await f();
+                return t;
+            }
+            finally
+            {
+                sw.Stop();
+                WriteLine($"`d it took {sw.ElapsedMilliseconds:N0} ms");
+            }
         }
 
         static async Task<(T Value, TimeSpan Elapsed)> TimeActionAsync<T>(Func<Task<T>> f)

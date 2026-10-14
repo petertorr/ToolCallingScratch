@@ -10,7 +10,7 @@
     },
     "stuff": {
       "commandName": "Project",
-      "commandLineArgs": "run -q -m -i",
+      "commandLineArgs": "run -m qwen3 -v",
       "hotReloadEnabled": true,
       "debugEngines": "managed,native"
     }
