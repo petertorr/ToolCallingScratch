@@ -11,7 +11,7 @@
     },
     "stuff": {
       "commandName": "Project",
-      "commandLineArgs": "run -m qwen3 -v",
+      "commandLineArgs": "help",
       "hotReloadEnabled": true,
       "debugEngines": "managed,native"
     }
