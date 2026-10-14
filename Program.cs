@@ -273,7 +273,12 @@ namespace ToolCallingScratch
     internal class Program
     {
         static readonly ChatMessage systemChatMessage = new("system",
-            "You are a helpful assistant that can use tools to answer user queries. If you need to call a tool, use the correct JSON format. Do not just say you will use it.");
+            """
+            You are a helpful assistant that can use tools to answer user queries. All prompts you receive will REQUIRE you
+            to make a tool call. Call tools via the structured tool_call API only, DO NOT write fake JSON or XML tool calls as text.
+            DO NOT output any additional "thinking" text or explanations. Always make tool calls via the tool_call API instead of 
+            saying you will do it. 
+            """);
 
         static readonly List<ToolDefinition> toolDefinitions = [
             ToolDefinition.DefineFunction(
@@ -292,7 +297,7 @@ namespace ToolCallingScratch
 
             ToolDefinition.DefineFunction(
                 new FunctionDefinitionBuilder("writeFile", "Writes a string to a named file.")
-                .AddParameter("filename", PropertyDefinition.DefineString("The name of the file to write to or delete."), true)
+                .AddParameter("filename", PropertyDefinition.DefineString("The name of the file to write to."), true)
                 .AddParameter("contents", PropertyDefinition.DefineString("The contents to write into the file."), true)
                 .AddParameter("overwrite", PropertyDefinition.DefineBoolean("Whether or not to overwrite an existing file."), true)
                 .Build()
@@ -525,6 +530,11 @@ namespace ToolCallingScratch
         {
             List<TestSuiteResults> results = [];
 
+            if (options.ShowVerbatimResponses)
+            {
+                WriteLine($"`dSystem prompt: {systemChatMessage.Content}");
+            }
+
             await EnumerateAllCandidateModelsAsync(catalog, async filterResult => results.Add((await RunOneModelVariantAsync(filterResult))));
 
             int total = 0;
@@ -532,7 +542,7 @@ namespace ToolCallingScratch
 
             WriteLine($"`w{"",30} |  Avg  |    Avg    |        |", true);
             WriteLine($"`w{"Alias",30} | Grade | {"Time (ms)",9} | Device | EP [name] ", true);
-
+            WriteLine($"`w{new string(' ', 23)}{new string('-', 8)}+{new string('-', 7)}+{new string('-', 11)}+{new string('-', 8)}+{new string('-', 12)}", true);
             foreach (var result in results)
             {
                 if (result.FilterResult.MatchKind is ModelMatchKind.NotRequested or ModelMatchKind.ExplicitlyIgnored)
@@ -553,10 +563,18 @@ namespace ToolCallingScratch
                     + $"`d{model.Info.Runtime!.ExecutionProvider} [{model.Info.Name}]", true);
             }
 
+            var numTested = total - ignored;
+            var numPassing = results.Where(x => x.AverageGrade is AverageTestGrade.A or AverageTestGrade.B).Count();
             WriteLine($"""
-                `wRan: {total - ignored,2}
-                `xIgnored: {ignored,2};
-                `yTotal: `{total,2};
+
+                `ySummary:
+
+                `w Models tested: {numTested,2}
+                `g          Pass: {numPassing,2}
+                `r          Fail: {numTested - numPassing,2}
+                `xModels ignored: {ignored,2}
+                `w==================
+                `y         Total: {total,2}
                 """);
 
             return ExitCode.Success;

@@ -1,4 +1,5 @@
-﻿using System.Runtime.InteropServices;
+﻿using System.Diagnostics;
+using System.Runtime.InteropServices;
 using ToolCallingScratch.CrashDetection.NativeInterop;
 
 namespace ToolCallingScratch.CrashDetection
@@ -24,7 +25,9 @@ namespace ToolCallingScratch.CrashDetection
         readonly struct EXCEPTION_POINTERS
         {
             readonly public IntPtr ExceptionRecord;
-            readonly public IntPtr ContextRecord;
+            readonly IntPtr ContextRecord;
+
+            public bool IsValid => ExceptionRecord != IntPtr.Zero;
         }
 
         // This is the basic exception record. If we know it's a VC++
@@ -67,6 +70,8 @@ namespace ToolCallingScratch.CrashDetection
                 var l4 = l3.Next(HInst);
                 return l4;
             }
+
+            public bool IsValid => Level1Ptr != IntPtr.Zero && NumberParameters == 4;
 
             // Visual C++ exception code.
             public const uint VcppExceptionCode = 0xE06D7363;
@@ -148,6 +153,11 @@ namespace ToolCallingScratch.CrashDetection
                 return 0;
             }
 
+            if (!exceptionInfo.IsValid)
+            {
+                return 0;
+            }
+
             var genericException = Marshal.PtrToStructure<EXCEPTION_RECORD64>(exceptionInfo.ExceptionRecord);
             if ((uint)(long)genericException.ExceptionCode != EXCEPTION_RECORD64_VCPP.VcppExceptionCode)
             {
@@ -156,6 +166,11 @@ namespace ToolCallingScratch.CrashDetection
 
             // re-marshal as the VC++-specific one
             var vcppExceptionRecord = Marshal.PtrToStructure<EXCEPTION_RECORD64_VCPP>(exceptionInfo.ExceptionRecord);
+
+            if (!vcppExceptionRecord.IsValid)
+            {
+                return 0;
+            }
             var vcppExceptionName = vcppExceptionRecord.GetVcppExceptionInfo();
             var className = vcppExceptionName.ClassName;
             if (className != OnnxThrownExceptionClassName)
@@ -202,6 +217,12 @@ namespace ToolCallingScratch.CrashDetection
         static IntPtr vectorRegistration = IntPtr.Zero;
         internal static void SetupExceptionHandling()
         {
+            // Nothing good happens from trying to mess with exceptions when VS is attached...
+            if (Debugger.IsAttached)
+            {
+                return;
+            }
+
             vectorRegistration = Win32.AddVectoredExceptionHandler(1, VectoredHandler);
         }
     }
