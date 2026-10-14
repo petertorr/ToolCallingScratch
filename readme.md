@@ -18,7 +18,11 @@ available options, and a description of each of the grades. The top-level comman
 
 * `ToolCallingScratch list` - lists models that meet selection criteria, but doesn't run them.
 * `ToolCallingScratch run` - runs the tests on models that meet selection criteria (see next section).
+* `ToolCallingScratch load` - loads the models that meet selection criteria, but doesn't run them.
 * `ToolCallingScratch help` - shows help.
+
+The `load` command is useful for testing which models are so broken they can't even load on your
+machine.
 
 # Running the test
 `ToolCallingScrath run` will run each model using the default ("best") execution provider for your device. 
