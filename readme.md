@@ -8,6 +8,13 @@ prompts that require tool-calling. Each prompt response is graded from **A** to 
 is the only acceptable grade (from a pure "does the model work as advertised?" sense) but a **B** should
 be sufficient for most purposes. Any other grade means the model failed and can't be used reliably.
 
+### Disk space warning
+
+Because this tool tries to run *a lot(!!)* of different models, it can use a **significant** amount of disk
+space for the Foundry Local cache - as in **over 200 GB of stuff** if you're not careful. You can always remove 
+the directory `%userprofile%\.ToolCallingScratch` and the required content will be downloaded again the next 
+time you use the tool.
+
 # Buliding
 Open the VS Project, select your architecture and go. Supports Windows, Mac, and Linux (personally I only 
 test Windows). 
