@@ -134,6 +134,7 @@ namespace ToolCallingScratch
     {
         List,
         Run,
+        Load,
         Help,
         Error
     }
@@ -180,8 +181,13 @@ namespace ToolCallingScratch
             {
                 action = ProgramAction.Run;
             }
+            else if (args[0].Equals("load", StringComparison.OrdinalIgnoreCase))
+            {
+                action = ProgramAction.Load;
+            }
             else
             {
+                Program.WriteLine($"{Environment.NewLine}`wApp mode '`o{args[0]}`w' not recognized; showing help.", true);
                 return MakeDefault(ProgramAction.Help);
             }
 
@@ -237,7 +243,6 @@ namespace ToolCallingScratch
                         break;
 
                     default:
-                        Program.WriteLine($"`r{args[index]} option not recognized.", true);
                         localIgnoredArgs.Add(args[index]);
                         break;
                 }
@@ -357,7 +362,7 @@ namespace ToolCallingScratch
 
             if (ignoredArgs.Count > 0)
             {
-                WriteLine($"`oIgnoring unknown arguments {string.Join(", ", ignoredArgs)}");
+                WriteLine($"`oIgnoring unknown arguments {string.Join(", ", ignoredArgs)}", true);
             }
 
             var sw = Stopwatch.StartNew();
@@ -390,7 +395,11 @@ namespace ToolCallingScratch
                 }
                 if (options.Action == ProgramAction.Run)
                 {
-                    return (int)await RunAsync(catalog);
+                    return (int)await RunAsync(catalog, true);
+                }
+                if (options.Action == ProgramAction.Load)
+                {
+                    return (int)await RunAsync(catalog, false);
                 }
 
                 throw (new NotImplementedException("Don't know what to do"));
@@ -415,10 +424,11 @@ namespace ToolCallingScratch
 
                 `wUsage
                 `w=====
-                   `w{exeName}`x `x     `x           `x- Same as '`y{exeName} run`x'.
-                   `w{exeName}`x `ylist `c[options]  `x- lists models that match given filters.
-                   `w{exeName}`x `yrun `c[options]   `x- runs test for models that match the given filters.
-                   `w{exeName}`x `yhelp `x           `x- this text.
+                   `w{exeName}`x `x     `x          `x- Same as '`y{exeName} run`x'.
+                   `w{exeName}`x `ylist `c[options] `x- lists models that match given filters.
+                   `w{exeName}`x `yrun `c[options]  `x- runs test for models that match the given filters.
+                   `w{exeName}`x `yload `c[options] `x- loads models that match given filters, but doesn't run tests.
+                   `w{exeName}`x `yhelp `x          `x- this text.
 
                 `wOptions (all are optional)
 
@@ -440,7 +450,7 @@ namespace ToolCallingScratch
                 `wGrades
                 `w======
                    {GetGradeInColor(AverageTestGrade.A)} - Correct tool call; the only `wreal`x passing grade.
-                   {GetGradeInColor(AverageTestGrade.B)} - No explicit tool call, but can be brute-forced.
+                   {GetGradeInColor(AverageTestGrade.B)} - No explicit tool call, but can be brute-forced (requires `c-b`x option).
                    {GetGradeInColor(AverageTestGrade.C)} - [Only used as an average; not an actual grade.]
                    {GetGradeInColor(AverageTestGrade.D)} - [Only used as an average; not an actual grade.]
                    {GetGradeInColor(AverageTestGrade.E)} - Attempt to make a tool call, but the name or parameters are incorrect.
@@ -470,7 +480,7 @@ namespace ToolCallingScratch
             return total > 0 ? ExitCode.Success : ExitCode.Fail;
         }
 
-        static async Task<TestSuiteResults> RunOneModelVariantAsync(ModelFilter.MatchInfo filterResult)
+        static async Task<TestSuiteResults> RunOneModelVariantAsync(ModelFilter.MatchInfo filterResult, bool runPrompts)
         {
             var combinedResult = new TestSuiteResults(filterResult);
             if (filterResult.MatchKind != ModelMatchKind.Matched)
@@ -492,6 +502,12 @@ namespace ToolCallingScratch
                 NativeExceptionHelper.IsLoadingModel = true;
                 await TimeActionAsync(() => model.LoadAsync(), "Loading model");
                 NativeExceptionHelper.IsLoadingModel = false;
+
+                if (!runPrompts)
+                {
+                    combinedResult.TestResults.Add(new(TestGrade.A, TimeSpan.FromSeconds(0)));
+                    return combinedResult;
+                }
                 var client = await TimeActionAsync(() => model.GetChatClientAsync(), "Getting chat client");
                 client.Settings.Temperature = 0f;
                 client.Settings.ToolChoice = options.RequireToolUse ? ToolChoice.Required : ToolChoice.Auto;
@@ -503,7 +519,7 @@ namespace ToolCallingScratch
             }
             catch (Exception ex)
             {
-                WriteLine($"`r{Environment.NewLine}ERROR: Cannot load model {filterResult.Name}:{Environment.NewLine}{GetExceptionMessage(ex)}");
+                WriteLine($"`r{Environment.NewLine}ERROR: Cannot load model {filterResult.Name}:{Environment.NewLine}{GetExceptionMessage(ex)}", true);
                 combinedResult.TestResults.Add(new(TestGrade.F, TimeSpan.FromSeconds(0)));
             }
             finally
@@ -526,16 +542,16 @@ namespace ToolCallingScratch
             return combinedResult;
         }
 
-        static async Task<ExitCode> RunAsync(ICatalog catalog)
+        static async Task<ExitCode> RunAsync(ICatalog catalog, bool runPrompts)
         {
             List<TestSuiteResults> results = [];
 
-            if (options.ShowVerbatimResponses)
+            if (options.ShowVerbatimResponses && runPrompts)
             {
                 WriteLine($"`dSystem prompt: {systemChatMessage.Content}");
             }
 
-            await EnumerateAllCandidateModelsAsync(catalog, async filterResult => results.Add((await RunOneModelVariantAsync(filterResult))));
+            await EnumerateAllCandidateModelsAsync(catalog, async filterResult => results.Add((await RunOneModelVariantAsync(filterResult, runPrompts))));
 
             int total = 0;
             int ignored = 0;
@@ -673,7 +689,7 @@ namespace ToolCallingScratch
             }
             catch (Exception ex)
             {
-                WriteLine($"`rRuntime error.{Environment.NewLine}{GetExceptionMessage(ex)}");
+                WriteLine($"`rRuntime error.{Environment.NewLine}{GetExceptionMessage(ex)}", true);
                 WriteLine($"GRADE: {GetGradeInColor(TestGrade.F)}");
                 exitCode = TestGrade.F;
             }
