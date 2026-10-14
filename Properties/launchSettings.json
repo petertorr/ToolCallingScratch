@@ -2,7 +2,18 @@
   "profiles": {
     "ToolCallingScratch": {
       "commandName": "Project",
-      "commandLineArgs": "qwen3-vl-2b-instruct"
+      "commandLineArgs": "run -m qwen2.5-0.5b -r",
+      "debugEngines": "managed,native"
+    },
+    "all": {
+      "commandName": "Project",
+      "commandLineArgs": "run"
+    },
+    "stuff": {
+      "commandName": "Project",
+      "commandLineArgs": "run -m qwen3 -v",
+      "hotReloadEnabled": true,
+      "debugEngines": "managed,native"
     }
   }
 }
