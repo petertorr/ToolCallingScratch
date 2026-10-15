@@ -427,7 +427,7 @@ namespace ToolCallingScratch
             }
             catch (Exception ex)
             {
-                WriteLine($"`r{Environment.NewLine}ERROR: {ex.Message}", true);
+                WriteLine($"`r{Environment.NewLine}{Environment.NewLine}ERROR: `a{ex.Message}", true);
                 Usage();
                 return (int)ExitCode.Other;
             }
@@ -540,7 +540,7 @@ namespace ToolCallingScratch
             }
             catch (Exception ex)
             {
-                WriteLine($"`r{Environment.NewLine}ERROR: Cannot load model {filterResult.Name}:{Environment.NewLine}{GetExceptionMessage(ex)}", true);
+                WriteLine($"`r{Environment.NewLine}{Environment.NewLine}ERROR: `aCannot load model {filterResult.Name}:{Environment.NewLine}{GetExceptionMessage(ex)}", true);
                 combinedResult.TestResults.Add(new(TestGrade.F, TimeSpan.FromSeconds(0)));
             }
             finally
@@ -705,13 +705,13 @@ namespace ToolCallingScratch
             // Never happens right now; see https://github.com/microsoft/foundry-local/issues/1193
             catch (TaskCanceledException)
             {
-                WriteLine($"`rERROR: Completion for model '{NativeExceptionHelper.CurrentModelName}' took longer than {options.TimeoutInSeconds} seconds to respond.");
+                WriteLine($"`r{Environment.NewLine}ERROR: `aCompletion for model '{NativeExceptionHelper.CurrentModelName}' took longer than {options.TimeoutInSeconds} seconds to respond.");
                 WriteLine($"GRADE: {GetGradeInColor(TestGrade.F)}");
                 exitCode = TestGrade.F;
             }
             catch (Exception ex)
             {
-                WriteLine($"`rERROR: Exception while running completion for model '{NativeExceptionHelper.CurrentModelName}'.{Environment.NewLine}{GetExceptionMessage(ex)}", true);
+                WriteLine($"`r{Environment.NewLine}ERROR: `aException while running completion for model '{NativeExceptionHelper.CurrentModelName}'.{Environment.NewLine}{GetExceptionMessage(ex)}", true);
                 WriteLine($"GRADE: {GetGradeInColor(TestGrade.F)}");
                 exitCode = TestGrade.F;
             }
@@ -806,6 +806,7 @@ namespace ToolCallingScratch
                     'y' => ConsoleColor.Yellow,
                     'n' => ConsoleColor.DarkGreen,
                     'o' => ConsoleColor.DarkYellow,
+                    'a' => ConsoleColor.DarkRed,
                     'm' => ConsoleColor.Magenta,
                     'c' => ConsoleColor.Cyan,
                     'd' => ConsoleColor.DarkGray,
