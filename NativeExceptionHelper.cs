@@ -191,7 +191,8 @@ namespace ToolCallingScratch.CrashDetection
             Program.WriteLine(text, true);
             Program.WriteLine($"`r{new string('*', text.Length - 6)}", true);
             DumpExceptionRecordChain(genericException);
-            Program.WriteLine($"{Environment.NewLine}`wIf the process crashes, add `c-i {CurrentModelName}`x to the command-line to ignore this model.", true);
+            Program.WriteLine($"{Environment.NewLine}`wIf the process crashes, add `c-i {CurrentModelName}`x to the command-line to ignore this model"
+                + $", or add `c-k {CurrentModelName}`x to resume at the next model in the list.", true);
             Program.WriteLine("`ySee https://github.com/microsoft/foundry-local/issues/1191 for bug on this issue.");
 
             return 0; // continue search

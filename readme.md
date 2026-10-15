@@ -92,11 +92,12 @@ the app will print a message *something like* this and terminate:
 ******************************************************************************
   Exception Address=7FF98137408A, Code=E06D7363, Flags=81, Params=4.
 
-If the process crashes, add -i qwen3-4b-cuda-gpu to the command-line to ignore this model.
+If the process crashes, add -i qwen3-4b-cuda-gpu to the command-line to ignore this model, 
+or add -k qwen3-4b-cuda-gpu to resume at the next model in the list.
 See https://github.com/microsoft/foundry-local/issues/1191 for bug on this issue.
 ```
 
-Note it tells you which model to ignore for your next run.
+Note it tells you which model to ignore (or skip past) for your next run.
 
 ### Runtime errors while debugging
 If a debugger is attached, the above exception-detection code dosn't execute - .NET isn't happy if you try 

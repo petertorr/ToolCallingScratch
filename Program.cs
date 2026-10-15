@@ -56,14 +56,21 @@ namespace ToolCallingScratch
         ExplicitlyIgnored
     }
 
-    record class ModelFilter(List<string> SpecificModels, int MaxSizeInMb, List<string> IgnoredModels, bool TryAllVariants, bool IgnoreToolsSupport, List<string> RegisteredEps, bool AllowCpu)
+    record class ModelFilter(List<string> SpecificModels, int MaxSizeInMb, List<string> IgnoredModels, bool TryAllVariants,
+        bool IgnoreToolsSupport, string? SkipPastModel, List<string> RegisteredEps, bool AllowCpu)
     {
         internal record class MatchInfo(string Name, IModel Model, ModelMatchKind MatchKind, string? ReasonForOmission);
         internal const int DefaultMaxFileSize = 6 * 1_024; // 6 gigs; reasonable default for machines with 16 GB of RAM.
 
-        internal static ModelFilter Default { get; } = new([], DefaultMaxFileSize, [], false, false, [], false);
+        internal static ModelFilter Default { get; } = new([], DefaultMaxFileSize, [], false, false, null, [], false);
 
         internal List<MatchInfo> GetAllMatches(IEnumerable<IModel> models)
+        {
+            bool foundSkipPast = false;
+            return GetAllMatchesImpl(models, ref foundSkipPast);
+        }
+
+        internal List<MatchInfo> GetAllMatchesImpl(IEnumerable<IModel> models, ref bool foundSkipPast)
         {
             List<MatchInfo> results = [];
             var optionsNoVariants = this with { TryAllVariants = false };
@@ -74,12 +81,12 @@ namespace ToolCallingScratch
                 {
                     foreach (var variant in model.Variants)
                     {
-                        results.AddRange(optionsNoVariants.GetAllMatches([variant]));
+                        results.AddRange(optionsNoVariants.GetAllMatchesImpl([variant], ref foundSkipPast));
                     }
                 }
                 else
                 {
-                    var matchKind = GetMatchResult(model, out var reason);
+                    var matchKind = GetMatchResult(model, ref foundSkipPast, out var reason);
                     results.Add(new(model.Info.Name, model, matchKind, reason));
                 }
             }
@@ -87,10 +94,20 @@ namespace ToolCallingScratch
             return results;
         }
 
-        internal ModelMatchKind GetMatchResult(IModel model, [NotNullWhen(false)] out string? reasonForOmission)
+        internal ModelMatchKind GetMatchResult(IModel model, ref bool foundSkipPast, [NotNullWhen(false)] out string? reasonForOmission)
         {
             reasonForOmission = null;
 
+            if (SkipPastModel is not null && !foundSkipPast)
+            {
+                if (model.Alias.Contains(SkipPastModel, StringComparison.OrdinalIgnoreCase) ||
+                    model.Info.Name.Contains(SkipPastModel, StringComparison.OrdinalIgnoreCase))
+                {
+                    foundSkipPast = true;
+                }
+                reasonForOmission = $"`oModel is being skipped.";
+                return ModelMatchKind.ExplicitlyIgnored;
+            }
             if (SpecificModels.Count > 0 && !SpecificModels.Any(name =>
                     model.Alias.Contains(name, StringComparison.OrdinalIgnoreCase) ||
                     model.Info.Name.Contains(name, StringComparison.OrdinalIgnoreCase)))
@@ -163,6 +180,7 @@ namespace ToolCallingScratch
             bool ignoreToolSupport = false;
             int timeout = DefaultTimeoutInSeconds;
             int maxSize = ModelFilter.DefaultMaxFileSize;
+            string? skipPast = null;
             List<string> requestedModels = [];
             List<string> ignoredModels = [];
             List<string> registeredEps = []; // will be filled out after loading.
@@ -242,6 +260,10 @@ namespace ToolCallingScratch
                         parseSuccess = ParseArgParam("-i", ignoredModels.Add, "a model name or alias to ignore");
                         break;
 
+                    case "-k":
+                        parseSuccess = ParseArgParam("-k", s => skipPast = s, "a model name or alias to skip past");
+                        break;
+
                     default:
                         localIgnoredArgs.Add(args[index]);
                         break;
@@ -255,9 +277,8 @@ namespace ToolCallingScratch
             }
 
             ignoredArgs = localIgnoredArgs;
-            return new(action, new(requestedModels, maxSize, ignoredModels, tryAllVariants, ignoreToolSupport, registeredEps, allowCpu),
-                requireToolUse,
-                bruteForce, showVerbatimResponses, quietMode, timeout);
+            return new(action, new(requestedModels, maxSize, ignoredModels, tryAllVariants, ignoreToolSupport, skipPast, registeredEps, allowCpu),
+                requireToolUse, bruteForce, showVerbatimResponses, quietMode, timeout);
 
             bool ParseArgParam(string param, Action<string> callback, string description)
             {
@@ -436,10 +457,10 @@ namespace ToolCallingScratch
                    `x  `x             `xIf choosing a specific name (not alias), you must include the '-v' option.
                    `c-s`b <fileSize>  `xMaximum model file size allowed, in MB. Default is {ModelFilter.DefaultMaxFileSize}.
                    `c-i`b <model>     `xName or alias of a model to ignore (substring match). Can be specified more than once.
+                   `c-k`b <model>     `xSkip past all models, including this one, before starting. Useful if a previous run crashed.
                    `c-c`x             `xEnable CPU-based models, if applicable for your hardware.
                    `c-v`x             `xInclude all variants for the selected model(s).
                    `c-a`x             `xTry all applicable models, even if they don't claim to support tool-calling.
-                
                    `c-f`x             `xForce tool calling (vs. leaving it as "auto").
                    `c-b`x             `xBrute-force tool-call attempts using basic pattern matching. Useful for some models.
                    `c-t`b <time>      `xTime, in seconds, to wait for the model to respond. Default is {Options.DefaultTimeoutInSeconds}.
