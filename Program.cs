@@ -681,15 +681,16 @@ namespace ToolCallingScratch
                     exitCode = TestGrade.F;
                 }
             }
+            // Never happens right now; see https://github.com/microsoft/foundry-local/issues/1193
             catch (TaskCanceledException)
             {
-                WriteLine($"`rChat took longer than {options.TimeoutInSeconds} seconds to respond.");
+                WriteLine($"`rERROR: Completion for model '{NativeExceptionHelper.CurrentModelName}' took longer than {options.TimeoutInSeconds} seconds to respond.");
                 WriteLine($"GRADE: {GetGradeInColor(TestGrade.F)}");
                 exitCode = TestGrade.F;
             }
             catch (Exception ex)
             {
-                WriteLine($"`rRuntime error.{Environment.NewLine}{GetExceptionMessage(ex)}", true);
+                WriteLine($"`rERROR: Exception while running completion for model '{NativeExceptionHelper.CurrentModelName}'.{Environment.NewLine}{GetExceptionMessage(ex)}", true);
                 WriteLine($"GRADE: {GetGradeInColor(TestGrade.F)}");
                 exitCode = TestGrade.F;
             }
