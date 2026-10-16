@@ -11,7 +11,7 @@
     },
     "stuff": {
       "commandName": "Project",
-      "commandLineArgs": "list -v -k qwen3-4b-cuda-gpu",
+      "commandLineArgs": "list -h",
       "hotReloadEnabled": true,
       "debugEngines": "managed,native"
     }
