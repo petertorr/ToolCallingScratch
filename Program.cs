@@ -117,7 +117,7 @@ namespace ToolCallingScratch
             }
 
             WriteLine($"`oNote: This app caches a lot of data in {Environment.ExpandEnvironmentVariables(
-                $@"%userprofile%\.{AppNameForFoundryLocal}\cache\models")}. Consider deleting the directory when you're done.", OutputModes.Status);
+                $@"%userprofile%\.{AppNameForFoundryLocal}\cache\models")}. Consider deleting the directory when you're done.", OutputModes.ImportantInfo);
 
             if (options.OutputModes == OutputModes.Default)
             {
@@ -268,6 +268,7 @@ namespace ToolCallingScratch
 
             int total = 0;
             int ignored = 0;
+            int noMatch = 0;
 
             await EnumerateAllCandidateModelsAsync(catalog, async filterResult =>
             {
@@ -292,19 +293,22 @@ namespace ToolCallingScratch
                 }
             }
 
-            var numTested = total - ignored;
-            var numPassing = results.Where(x => x.AverageGrade is AverageTestGrade.A or AverageTestGrade.B).Count();
+            var numSelected = total - ignored;
+            var numTested = numSelected - noMatch;
+            var numPassing = results.Count(x => x.AverageGrade is AverageTestGrade.A or AverageTestGrade.B);
+            
             WriteLine($"""
 
                 `ySummary:
 
-                `w Models tested: {numTested,2}
-                `g          Pass: {numPassing,2}
-                `r          Fail: {numTested - numPassing,2}
-                `xModels ignored: {ignored,2}
-                `w==================
-                `y         Total: {total,2}
-                """);
+                `x     Models ignored: {ignored,2}
+                `xModels filtered out: {noMatch,2}
+                `w      Models tested: {numTested,2}
+                `g               Pass: {numPassing,2}
+                `r               Fail: {numTested - numPassing,2}
+                `w=======================
+                `y              Total: {total,2}
+                """, OutputModes.ImportantInfo);
 
             return ExitCode.Success;
 
@@ -317,15 +321,17 @@ namespace ToolCallingScratch
 
             void HandleOneResult(TestSuiteResults result)
             {
+                total++;
+
                 if (result.FilterResult.MatchKind is ModelMatchKind.NotRequested or ModelMatchKind.ExplicitlyIgnored)
                 {
+                    ignored++;
                     return;
                 }
 
-                total++;
                 if (result.FilterResult.MatchKind == ModelMatchKind.DidntMatch)
                 {
-                    ignored++;
+                    noMatch++;
                     return;
                 }
 
