@@ -61,22 +61,22 @@ namespace ToolCallingScratch
                 {
                     foundSkipPast = true;
                 }
-                reasonForOmission = $"`oModel is being skipped.";
+                reasonForOmission = $"`yModel is being skipped.";
+                return ModelMatchKind.ExplicitlyIgnored;
+            }
+            if (IgnoredModels.Any(name =>
+                model.Alias.Contains(name, StringComparison.OrdinalIgnoreCase) ||
+                model.Info.Name.Contains(name, StringComparison.OrdinalIgnoreCase)))
+            {
+                reasonForOmission = $"`yModel is explicitly ignored.";
                 return ModelMatchKind.ExplicitlyIgnored;
             }
             if (SpecificModels.Count > 0 && !SpecificModels.Any(name =>
                     model.Alias.Contains(name, StringComparison.OrdinalIgnoreCase) ||
                     model.Info.Name.Contains(name, StringComparison.OrdinalIgnoreCase)))
             {
-                reasonForOmission = $"`oModel doesn't match a requested name or alias.";
+                reasonForOmission = $"`gModel doesn't match a requested name or alias.";
                 return ModelMatchKind.NotRequested;
-            }
-            if (IgnoredModels.Any(name =>
-                model.Alias.Contains(name, StringComparison.OrdinalIgnoreCase) ||
-                model.Info.Name.Contains(name, StringComparison.OrdinalIgnoreCase)))
-            {
-                reasonForOmission = $"`oModel is explicitly ignored.";
-                return ModelMatchKind.ExplicitlyIgnored;
             }
             if (!IgnoreToolsSupport && (!model.Info.SupportsToolCalling.HasValue || model.Info.SupportsToolCalling.Value == false))
             {
