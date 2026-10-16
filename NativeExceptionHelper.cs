@@ -183,12 +183,12 @@ namespace ToolCallingScratch.CrashDetection
             lastModelName = Program.CurrentModelName;
 
             var text = $"`r*** `wVisual C++ Exception '{className}' detected `r***";
-            Program.WriteLine($"{Environment.NewLine}{Environment.NewLine}`r{new string('*', text.Length - 6)}", true);
-            Program.WriteLine(text, true);
-            Program.WriteLine($"`r{new string('*', text.Length - 6)}", true);
+            Program.WriteLine($"{Environment.NewLine}{Environment.NewLine}`r{new string('*', text.Length - 6)}", OutputModes.FatalError);
+            Program.WriteLine(text, OutputModes.FatalError);
+            Program.WriteLine($"`r{new string('*', text.Length - 6)}", OutputModes.FatalError);
             DumpExceptionRecordChain(genericException);
             Program.WriteLine($"{Environment.NewLine}`wIf the process crashes, add `c-i {Program.CurrentModelName}`x to the command-line to ignore this model"
-                + $", or add `c-k {Program.CurrentModelName}`x to resume at the next model in the list.", true);
+                + $", or add `c-k {Program.CurrentModelName}`x to resume at the next model in the list.", OutputModes.FatalError);
             Program.WriteLine("`ySee https://github.com/microsoft/foundry-local/issues/1191 for bug on this issue.");
 
             return 0; // continue search
@@ -199,7 +199,8 @@ namespace ToolCallingScratch.CrashDetection
             string indent = "  ";
             do
             {
-                Program.WriteLine($"{indent}Exception Address={exception.ExceptionAddress:X}, Code={exception.ExceptionCode:X}, Flags={exception.ExceptionFlags:X}, Params={exception.NumberParameters}.", true);
+                Program.WriteLine($"{indent}Exception Address={exception.ExceptionAddress:X}, Code={exception.ExceptionCode:X}, "
+                    + $"Flags={exception.ExceptionFlags:X}, Params={exception.NumberParameters}.", OutputModes.Errors);
 
                 if (!exception.Next.HasValue)
                 {
