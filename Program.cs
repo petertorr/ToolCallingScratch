@@ -95,6 +95,8 @@ namespace ToolCallingScratch
         // The 'unhandled native exception' crash only happens during mode loading.
         internal static bool IsLoadingModel { get; set; } = false;
 
+        const string AppNameForFoundryLocal = "ToolCallingScratch";
+
         static async Task<int> Main(string[] args)
         {
             NativeExceptionHelper.SetupExceptionHandling();
@@ -114,6 +116,9 @@ namespace ToolCallingScratch
                 return (int)ExitCode.Other;
             }
 
+            WriteLine($"`oNote: This app caches a lot of data in {Environment.ExpandEnvironmentVariables(
+                $@"%userprofile%\.{AppNameForFoundryLocal}\cache\models")}. Consider deleting the directory when you're done.", OutputModes.Status);
+
             if (options.OutputModes == OutputModes.Default)
             {
                 WriteLine($"`yShowing (almost) all output; use `c-h`x, `c-q`x, or `c-z`w to minimize output.", OutputModes.ProgramOutput);
@@ -122,7 +127,6 @@ namespace ToolCallingScratch
             {
                 WriteLine($"`ySuppressing some output; app may appear to hang for several minutes at a time...", OutputModes.ImportantInfo);
             }
-
             if (ignoredArgs.Count > 0)
             {
                 WriteLine($"`oIgnoring unknown arguments {string.Join(", ", ignoredArgs)}", OutputModes.Status);
@@ -131,7 +135,7 @@ namespace ToolCallingScratch
             var sw = Stopwatch.StartNew();
             try
             {
-                await TimeActionAsync(() => FoundryLocalManager.CreateAsync(new() { AppName = "ToolCallingScratch" }, NullLogger.Instance), "Creating FoundryLocal instance");
+                await TimeActionAsync(() => FoundryLocalManager.CreateAsync(new() { AppName = AppNameForFoundryLocal }, NullLogger.Instance), "Creating FoundryLocal instance");
                 using var instance = FoundryLocalManager.Instance;
                 var eps = await TimeActionAsync(() => instance.DownloadAndRegisterEpsAsync(), "Registering EPs");
                 options.Filter!.RegisteredEps.AddRange(eps.RegisteredEps);
