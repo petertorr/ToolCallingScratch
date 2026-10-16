@@ -134,12 +134,7 @@ namespace ToolCallingScratch.CrashDetection
         // The name of the object being thrown, as of writing...
         const string OnnxThrownExceptionClassName = ".?AVOnnxRuntimeException@onnxruntime@@";
 
-        // Stash the current name so we can show it to the user.
-        internal static string? CurrentModelName { get; set; }
         static string? lastModelName = null;
-
-        // The unhandled crash appears during loading.
-        internal static bool IsLoadingModel { get; set; } = false;
 
         static long VectoredHandler(ref EXCEPTION_POINTERS exceptionInfo)
         {
@@ -148,7 +143,7 @@ namespace ToolCallingScratch.CrashDetection
 
         static long ExceptionHandler(ref EXCEPTION_POINTERS exceptionInfo)
         {
-            if (!IsLoadingModel)
+            if (!Program.IsLoadingModel)
             {
                 return 0;
             }
@@ -178,21 +173,22 @@ namespace ToolCallingScratch.CrashDetection
                 return 0;
             }
 
-            // Check for the same error exception twice (probably due to 1st-chance and then final throw)?
-            if (CurrentModelName == lastModelName)
+            // Check for the same error on the same model twice in a row
+            // (probably due to 1st-chance and then final throw)
+            if (Program.CurrentModelName == lastModelName)
             {
                 return 0;
             }
 
-            lastModelName = CurrentModelName;
+            lastModelName = Program.CurrentModelName;
 
             var text = $"`r*** `wVisual C++ Exception '{className}' detected `r***";
             Program.WriteLine($"{Environment.NewLine}{Environment.NewLine}`r{new string('*', text.Length - 6)}", true);
             Program.WriteLine(text, true);
             Program.WriteLine($"`r{new string('*', text.Length - 6)}", true);
             DumpExceptionRecordChain(genericException);
-            Program.WriteLine($"{Environment.NewLine}`wIf the process crashes, add `c-i {CurrentModelName}`x to the command-line to ignore this model"
-                + $", or add `c-k {CurrentModelName}`x to resume at the next model in the list.", true);
+            Program.WriteLine($"{Environment.NewLine}`wIf the process crashes, add `c-i {Program.CurrentModelName}`x to the command-line to ignore this model"
+                + $", or add `c-k {Program.CurrentModelName}`x to resume at the next model in the list.", true);
             Program.WriteLine("`ySee https://github.com/microsoft/foundry-local/issues/1191 for bug on this issue.");
 
             return 0; // continue search

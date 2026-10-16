@@ -357,6 +357,12 @@ namespace ToolCallingScratch
 
         static readonly string exeName = Path.GetFileNameWithoutExtension(Environment.ProcessPath)!;
 
+        // Stash the current name so we can show it to the user in an error message without passing it around.
+        internal static string? CurrentModelName { get; set; }
+
+        // The 'unhandled native exception' crash only happens during mode loading.
+        internal static bool IsLoadingModel { get; set; } = false;
+
         static async Task<int> Main(string[] args)
         {
             NativeExceptionHelper.SetupExceptionHandling();
@@ -519,10 +525,10 @@ namespace ToolCallingScratch
             try
             {
                 await TimeActionAsync(() => model.DownloadAsync(), "Downloading model");
-                NativeExceptionHelper.CurrentModelName = model.Info.Name;
-                NativeExceptionHelper.IsLoadingModel = true;
+                CurrentModelName = model.Info.Name;
+                IsLoadingModel = true;
                 await TimeActionAsync(() => model.LoadAsync(), "Loading model");
-                NativeExceptionHelper.IsLoadingModel = false;
+                IsLoadingModel = false;
 
                 if (!runPrompts)
                 {
@@ -705,13 +711,13 @@ namespace ToolCallingScratch
             // Never happens right now; see https://github.com/microsoft/foundry-local/issues/1193
             catch (TaskCanceledException)
             {
-                WriteLine($"`r{Environment.NewLine}ERROR: `aCompletion for model '{NativeExceptionHelper.CurrentModelName}' took longer than {options.TimeoutInSeconds} seconds to respond.");
+                WriteLine($"`r{Environment.NewLine}ERROR: `aCompletion for model '{CurrentModelName}' took longer than {options.TimeoutInSeconds} seconds to respond.");
                 WriteLine($"GRADE: {GetGradeInColor(TestGrade.F)}");
                 exitCode = TestGrade.F;
             }
             catch (Exception ex)
             {
-                WriteLine($"`r{Environment.NewLine}ERROR: `aException while running completion for model '{NativeExceptionHelper.CurrentModelName}'.{Environment.NewLine}{GetExceptionMessage(ex)}", true);
+                WriteLine($"`r{Environment.NewLine}ERROR: `aException while running completion for model '{CurrentModelName}'.{Environment.NewLine}{GetExceptionMessage(ex)}", true);
                 WriteLine($"GRADE: {GetGradeInColor(TestGrade.F)}");
                 exitCode = TestGrade.F;
             }
