@@ -4,7 +4,6 @@ using Betalgo.Ranul.OpenAI.ObjectModels.SharedModels;
 using Microsoft.AI.Foundry.Local;
 using Microsoft.Extensions.Logging.Abstractions;
 using System.Diagnostics;
-using System.Diagnostics.CodeAnalysis;
 using System.Runtime.InteropServices;
 using ToolCallingScratch.CrashDetection;
 
@@ -96,11 +95,13 @@ namespace ToolCallingScratch
         // The 'unhandled native exception' crash only happens during mode loading.
         internal static bool IsLoadingModel { get; set; } = false;
 
+        const string AppNameForFoundryLocal = "ToolCallingScratch";
+
         static async Task<int> Main(string[] args)
         {
             NativeExceptionHelper.SetupExceptionHandling();
 
-            WriteLine($"`w{exeName} ({RuntimeInformation.ProcessArchitecture})", true);
+            WriteLine($"`w{exeName} ({RuntimeInformation.ProcessArchitecture})", OutputModes.Status);
 
             options = Options.Parse(args, out var ignoredArgs);
 
@@ -111,28 +112,30 @@ namespace ToolCallingScratch
             }
             if (options.Action is ProgramAction.Error)
             {
-                WriteLine($"Use `y{exeName} help`x for help.", true);
+                WriteLine($"Use `y{exeName} help`x for help.", OutputModes.ProgramOutput);
                 return (int)ExitCode.Other;
             }
 
-            if (options.QuietMode)
-            {
-                WriteLine($"`yQuiet Mode; app may appear to hang for several minutes...", true);
-            }
-            else if (options.HideTimings)
-            {
-                WriteLine($"`yHiding timings; app may appear to hang for a few seconds...", true);
-            }
+            WriteLine($"`oNote: This app caches a lot of data in {Environment.ExpandEnvironmentVariables(
+                $@"%userprofile%\.{AppNameForFoundryLocal}\cache\models")}. Consider deleting the directory when you're done.", OutputModes.ImportantInfo);
 
+            if (options.OutputModes == OutputModes.Default)
+            {
+                WriteLine($"`yShowing (almost) all output; use `c-h`x, `c-q`x, or `c-z`w to minimize output.", OutputModes.ProgramOutput);
+            }
+            else if ((options.OutputModes & OutputModes.Timings) == 0)
+            {
+                WriteLine($"`ySuppressing some output; app may appear to hang for several minutes at a time...", OutputModes.ImportantInfo);
+            }
             if (ignoredArgs.Count > 0)
             {
-                WriteLine($"`oIgnoring unknown arguments {string.Join(", ", ignoredArgs)}", true);
+                WriteLine($"`oIgnoring unknown arguments {string.Join(", ", ignoredArgs)}", OutputModes.Status);
             }
 
             var sw = Stopwatch.StartNew();
             try
             {
-                await TimeActionAsync(() => FoundryLocalManager.CreateAsync(new() { AppName = "ToolCallingScratch" }, NullLogger.Instance), "Creating FoundryLocal instance");
+                await TimeActionAsync(() => FoundryLocalManager.CreateAsync(new() { AppName = AppNameForFoundryLocal }, NullLogger.Instance), "Creating FoundryLocal instance");
                 using var instance = FoundryLocalManager.Instance;
                 var eps = await TimeActionAsync(() => instance.DownloadAndRegisterEpsAsync(), "Registering EPs");
                 options.Filter!.RegisteredEps.AddRange(eps.RegisteredEps);
@@ -150,7 +153,7 @@ namespace ToolCallingScratch
                 }
                 if (eps.FailedEps.Length > 0)
                 {
-                    WriteLine($"`rFailed EPs: {string.Join(", ", eps.FailedEps)}.");
+                    WriteLine($"`rFailed EPs: {string.Join(", ", eps.FailedEps)}.", OutputModes.Errors);
                 }
 
                 if (options.Action == ProgramAction.List)
@@ -170,13 +173,13 @@ namespace ToolCallingScratch
             }
             catch (Exception ex)
             {
-                WriteLine($"`r{Environment.NewLine}{Environment.NewLine}ERROR: `a{ex.Message}", true);
+                WriteLine($"`r{Environment.NewLine}{Environment.NewLine}ERROR: `a{ex.Message}", OutputModes.Errors);
                 Usage();
                 return (int)ExitCode.Other;
             }
             finally
             {
-                WriteLine($"`d[Total time: {sw.Elapsed.TotalSeconds:N2} seconds]", true);
+                WriteLine($"`d[Total time: {sw.Elapsed.TotalSeconds:N2} seconds]", OutputModes.Status);
             }
         }
 
@@ -209,8 +212,10 @@ namespace ToolCallingScratch
                    `c-t`b <time>      `xTime, in seconds, to wait for the model to respond. Default is {Options.DefaultTimeoutInSeconds}.
                 
                    `c-h`x             `xHide most timing info.
+                   `c-p`x             `xProgressive mode; shows results progressively. Implies `c-z`x (no other output).
                    `c-r`x             `xShow verbatim responses from the models (sometimes good for a laugh).
-                   `c-q`x             `xQuiet mode; suppresses most of the app's output. May appear to hang while it's working.
+                   `c-q`x             `xQuiet mode; suppresses most app output except errors and results. May appear to hang while it's working.
+                   `c-z`x             `xSuper quiet mode; only shows program output and fatal errors. May appear to hang while it's working.
                 
                 `wGrades
                 `w======
@@ -222,7 +227,7 @@ namespace ToolCallingScratch
                    {GetGradeInColor(AverageTestGrade.F)} - No attempt to make a tool call, and couldn't brute-force it either.
                                                         
                 `wExit code is 0 for success, > 0 for an error.
-                """, true);
+                """, OutputModes.ProgramOutput);
         }
 
         static async Task<ExitCode> ListAsync(ICatalog catalog)
@@ -234,7 +239,9 @@ namespace ToolCallingScratch
                 if (filteredResult.MatchKind == ModelMatchKind.Matched)
                 {
                     var model = filteredResult.Model;
-                    WriteLine($"`w{filteredResult.Model.Alias,30} ({GetDeviceTypeInColor(model)}) `y{model.Info.Runtime!.ExecutionProvider,-25} `d[{model.Info.Name}]", true);
+                    WriteLine($"`w{filteredResult.Model.Alias,30} ({GetDeviceTypeInColor(model)}) "
+                        + $"`y{model.Info.Runtime!.ExecutionProvider,-25} `d[{model.Info.Name}]", OutputModes.ProgramOutput);
+
                     ++total;
                 }
 
@@ -249,54 +256,90 @@ namespace ToolCallingScratch
         {
             List<TestSuiteResults> results = [];
 
-            if (options.ShowVerbatimResponses && runPrompts)
+            if (runPrompts)
             {
-                WriteLine($"`dSystem prompt: {systemChatMessage.Content}");
+                WriteLine($"`dSystem prompt: {systemChatMessage.Content}", OutputModes.VerbatimOutput);
             }
 
-            await EnumerateAllCandidateModelsAsync(catalog, async filterResult => results.Add((await RunOneModelVariantAsync(filterResult, runPrompts))));
+            if (options.ProgressiveOutput)
+            {
+                WriteHeader();
+            }
 
             int total = 0;
             int ignored = 0;
+            int noMatch = 0;
 
-            WriteLine($"`w{"",30} |  Avg  |    Avg    |        |", true);
-            WriteLine($"`w{"Alias",30} | Grade | {"Time (ms)",9} | Device | EP [name] ", true);
-            WriteLine($"`w{new string(' ', 23)}{new string('-', 8)}+{new string('-', 7)}+{new string('-', 11)}+{new string('-', 8)}+{new string('-', 12)}", true);
-            foreach (var result in results)
+            await EnumerateAllCandidateModelsAsync(catalog, async filterResult =>
             {
+                var result = await RunOneModelVariantAsync(filterResult, runPrompts);
+                if (options.ProgressiveOutput)
+                {
+                    HandleOneResult(result);
+                }
+                else
+                {
+                    results.Add(result);
+                }
+            });
+
+            if (!options.ProgressiveOutput)
+            {
+                WriteHeader();
+
+                foreach (var result in results)
+                {
+                    HandleOneResult(result);
+                }
+            }
+
+            var numSelected = total - ignored;
+            var numTested = numSelected - noMatch;
+            var numPassing = results.Count(x => x.AverageGrade is AverageTestGrade.A or AverageTestGrade.B);
+            
+            WriteLine($"""
+
+                `ySummary:
+
+                `x     Models ignored: {ignored,2}
+                `xModels filtered out: {noMatch,2}
+                `w      Models tested: {numTested,2}
+                `g               Pass: {numPassing,2}
+                `r               Fail: {numTested - numPassing,2}
+                `w=======================
+                `y              Total: {total,2}
+                """, OutputModes.ImportantInfo);
+
+            return ExitCode.Success;
+
+            void WriteHeader()
+            {
+                WriteLine($"`w{"",30} |  Avg  |    Avg    |        |", OutputModes.ProgramOutput);
+                WriteLine($"`w{"Alias",30} | Grade | {"Time (ms)",9} | Device | EP [name] ", OutputModes.ProgramOutput);
+                WriteLine($"`w{new string(' ', 23)}{new string('-', 8)}+{new string('-', 7)}+{new string('-', 11)}+{new string('-', 8)}+{new string('-', 12)}", OutputModes.ProgramOutput);
+            }
+
+            void HandleOneResult(TestSuiteResults result)
+            {
+                total++;
+
                 if (result.FilterResult.MatchKind is ModelMatchKind.NotRequested or ModelMatchKind.ExplicitlyIgnored)
                 {
-                    continue;
+                    ignored++;
+                    return;
                 }
 
-                total++;
                 if (result.FilterResult.MatchKind == ModelMatchKind.DidntMatch)
                 {
-                    ignored++;
-                    continue;
+                    noMatch++;
+                    return;
                 }
 
                 var model = result.FilterResult.Model;
                 WriteLine($"`w{model.Alias,30}`w |   {GetGradeInColor(result.AverageGrade)}`w   | "
                     + $"{result.AverageTime.TotalMilliseconds,9:N0} |   {GetDeviceTypeInColor(model)}`w  | "
-                    + $"`d{model.Info.Runtime!.ExecutionProvider} [{model.Info.Name}]", true);
+                    + $"`d{model.Info.Runtime!.ExecutionProvider} [{model.Info.Name}]", OutputModes.ProgramOutput);
             }
-
-            var numTested = total - ignored;
-            var numPassing = results.Where(x => x.AverageGrade is AverageTestGrade.A or AverageTestGrade.B).Count();
-            WriteLine($"""
-
-                `ySummary:
-
-                `w Models tested: {numTested,2}
-                `g          Pass: {numPassing,2}
-                `r          Fail: {numTested - numPassing,2}
-                `xModels ignored: {ignored,2}
-                `w==================
-                `y         Total: {total,2}
-                """);
-
-            return ExitCode.Success;
         }
 
         static async Task<TestSuiteResults> RunOneModelVariantAsync(MatchInfo filterResult, bool runPrompts)
@@ -338,7 +381,7 @@ namespace ToolCallingScratch
             }
             catch (Exception ex)
             {
-                WriteLine($"`r{Environment.NewLine}{Environment.NewLine}ERROR: `aCannot load model {filterResult.Name}:{Environment.NewLine}{GetExceptionMessage(ex)}", true);
+                WriteLine($"`r{Environment.NewLine}{Environment.NewLine}ERROR: `aCannot load model {filterResult.Name}:{Environment.NewLine}{GetExceptionMessage(ex)}", OutputModes.Errors);
                 combinedResult.TestResults.Add(new(TestGrade.F, TimeSpan.FromSeconds(0)));
             }
             finally
@@ -389,7 +432,7 @@ namespace ToolCallingScratch
 
         static async Task<TestGrade> ExecutePromptAsync(OpenAIChatClient client, ToolCallingTestMetadata test)
         {
-            TestGrade exitCode = TestGrade.F;
+            TestGrade grade = TestGrade.F;
             List<ChatMessage> messages = [systemChatMessage];
             messages.Add(new("user", test.UserPrompt));
 
@@ -414,22 +457,18 @@ namespace ToolCallingScratch
                 var message = reply.Message;
                 var content = message.Content!;
 
-                if (options.ShowVerbatimResponses)
-                {
-                    WriteLine($"`aVerbatim response:{Environment.NewLine}---{Environment.NewLine}{message.Content}{Environment.NewLine}---");
-                }
+                WriteLine($"`dVerbatim response:{Environment.NewLine}---{Environment.NewLine}{message.Content}{Environment.NewLine}---",
+                    OutputModes.VerbatimOutput);
 
                 if (reply.FinishReason == "tool_calls")
                 {
                     if (IsExpectedFunctionCall(reply.Message.ToolCalls![0].FunctionCall!, test))
                     {
-                        WriteLine($"GRADE: {GetGradeInColor(TestGrade.A)}");
-                        exitCode = TestGrade.A;
+                        grade = TestGrade.A;
                     }
                     else
                     {
-                        WriteLine($"GRADE: {GetGradeInColor(TestGrade.E)}");
-                        exitCode = TestGrade.E;
+                        grade = TestGrade.E;
                     }
                 }
                 // Try to brute-force it
@@ -437,30 +476,27 @@ namespace ToolCallingScratch
                     BruteForceToolCallParser.TryBruteForceFunctionCall(message.Content!, toolDefinitions, out var toolCall)
                     && IsExpectedFunctionCall(toolCall, test))
                 {
-                    WriteLine($"GRADE: {GetGradeInColor(TestGrade.B)}");
-                    exitCode = TestGrade.B;
+                    grade = TestGrade.B;
                 }
                 else
                 {
-                    WriteLine($"GRADE: {GetGradeInColor(TestGrade.F)}");
-                    exitCode = TestGrade.F;
+                    grade = TestGrade.F;
                 }
             }
             // Never happens right now; see https://github.com/microsoft/foundry-local/issues/1193
             catch (TaskCanceledException)
             {
-                WriteLine($"`r{Environment.NewLine}ERROR: `aCompletion for model '{CurrentModelName}' took longer than {options.TimeoutInSeconds} seconds to respond.");
-                WriteLine($"GRADE: {GetGradeInColor(TestGrade.F)}");
-                exitCode = TestGrade.F;
+                WriteLine($"`r{Environment.NewLine}ERROR: `aCompletion for model '{CurrentModelName}' took longer than {options.TimeoutInSeconds} seconds to respond.", OutputModes.Errors);
+                grade = TestGrade.F;
             }
             catch (Exception ex)
             {
-                WriteLine($"`r{Environment.NewLine}ERROR: `aException while running completion for model '{CurrentModelName}'.{Environment.NewLine}{GetExceptionMessage(ex)}", true);
-                WriteLine($"GRADE: {GetGradeInColor(TestGrade.F)}");
-                exitCode = TestGrade.F;
+                WriteLine($"`r{Environment.NewLine}ERROR: `aException while running completion for model '{CurrentModelName}'.{Environment.NewLine}{GetExceptionMessage(ex)}", OutputModes.Errors);
+                grade = TestGrade.F;
             }
 
-            return exitCode;
+            WriteLine($"Test: `w{test.ExpectedFunctionName}`x. Grade: {GetGradeInColor(grade)}", OutputModes.IntermediateResults);
+            return grade;
         }
 
         static async Task EnumerateAllCandidateModelsAsync(ICatalog catalog, Func<MatchInfo, Task> callback)
@@ -512,13 +548,13 @@ namespace ToolCallingScratch
                 """);
         }
 
-        internal static void WriteLine(string content) => WriteLine(content, false);
-        internal static void WriteLine(string content, bool bypassQuietMode) => Write(content + Environment.NewLine, bypassQuietMode);
+        internal static void WriteLine(string content) => WriteLine(content, OutputModes.Status);
+        internal static void WriteLine(string content, OutputModes mode) => Write(content + Environment.NewLine, mode);
 
-        internal static void Write(string content) => Write(content, false);
-        internal static void Write(string content, bool bypassQuietMode)
+        internal static void Write(string content) => Write(content, OutputModes.Status);
+        internal static void Write(string content, OutputModes mode)
         {
-            if (options.QuietMode && !bypassQuietMode)
+            if (!options.OutputModes.HasFlag(mode))
             {
                 return;
             }
@@ -589,10 +625,8 @@ namespace ToolCallingScratch
 
         static async Task<T> TimeActionAsync<T>(Func<Task<T>> f, string description)
         {
-            if (!options.HideTimings)
-            {
-                Write($"`d{description}... ");
-            }
+            Write($"`d{description}... ", OutputModes.Timings);
+
             var sw = Stopwatch.StartNew();
             try
             {
@@ -602,10 +636,7 @@ namespace ToolCallingScratch
             finally
             {
                 sw.Stop();
-                if (!options.HideTimings)
-                {
-                    WriteLine($"`d it took {sw.ElapsedMilliseconds:N0} ms");
-                }
+                WriteLine($"`d it took {sw.ElapsedMilliseconds:N0} ms", OutputModes.Timings);
             }
         }
 
@@ -618,150 +649,25 @@ namespace ToolCallingScratch
         }
     }
 
-    record class TimeActionResult<T>(T Value, TimeSpan Elapsed);
-
-    record class Options(ProgramAction Action, ModelFilter Filter, bool RequireToolUse, bool BruteForce, bool ShowVerbatimResponses,
-        bool QuietMode, bool HideTimings, int TimeoutInSeconds)
+    [Flags]
+    enum OutputModes
     {
-        internal const int DefaultTimeoutInSeconds = 60 * 1; // Time to wait for an answer. It's a trivial prompt...
+        None = 0,
+        ProgramOutput = 1 << 0,
+        ImportantInfo= 1 << 1, // Shown for Quiet but not SuperQuiet
+        FatalError = 1 << 2,
+        Errors = 1 << 3,
+        Timings = 1 << 4,
+        VerbatimOutput = 1 << 5,
+        Status = 1 << 6,
+        IntermediateResults = 1 << 7,
+        All = 0xFF,
 
-        static Options MakeDefault(ProgramAction action) => new(action, ModelFilter.Default, false,
-            false, false, false, false, DefaultTimeoutInSeconds);
-
-        internal static Options DefaultBeforeParsing { get; } = MakeDefault(ProgramAction.Help);
-
-        internal static Options Parse(string[] args, out List<string> ignoredArgs)
-        {
-            int index = 0;
-            ignoredArgs = [];
-            List<string> localIgnoredArgs = [];
-            bool allowCpu = false;
-            bool requireToolUse = false;
-            bool tryAllVariants = false;
-            bool bruteForce = false;
-            bool showVerbatimResponses = false;
-            bool quietMode = false;
-            bool ignoreToolSupport = false;
-            bool hideTimings = false;
-            int timeout = DefaultTimeoutInSeconds;
-            int maxSize = ModelFilter.DefaultMaxFileSize;
-            string? skipPast = null;
-            List<string> requestedModels = [];
-            List<string> ignoredModels = [];
-            List<string> registeredEps = []; // will be filled out after loading.
-            ProgramAction action = ProgramAction.Help;
-
-            // Specifying nothing is the same as 'run' with no other args
-            if (args.Length == 0)
-            {
-                return MakeDefault(ProgramAction.Run);
-            }
-            if (args[0].Equals("list", StringComparison.OrdinalIgnoreCase))
-            {
-                action = ProgramAction.List;
-            }
-            else if (args[0].Equals("run", StringComparison.OrdinalIgnoreCase))
-            {
-                action = ProgramAction.Run;
-            }
-            else if (args[0].Equals("load", StringComparison.OrdinalIgnoreCase))
-            {
-                action = ProgramAction.Load;
-            }
-            else
-            {
-                Program.WriteLine($"{Environment.NewLine}`wApp mode '`o{args[0]}`w' not recognized; showing help.", true);
-                return MakeDefault(ProgramAction.Help);
-            }
-
-            bool parseSuccess = true;
-
-            // Start at 1, not 0, since we got the action from args[0]
-            for (index = 1; index < args.Length; ++index)
-            {
-                switch (args[index].ToLowerInvariant())
-                {
-                    case "-v":
-                        tryAllVariants = true;
-                        break;
-
-                    case "-c":
-                        allowCpu = true;
-                        break;
-
-                    case "-f":
-                        requireToolUse = true;
-                        break;
-
-                    case "-b":
-                        bruteForce = true;
-                        break;
-
-                    case "-r":
-                        showVerbatimResponses = true;
-                        break;
-
-                    case "-a":
-                        ignoreToolSupport = true;
-                        break;
-
-                    case "-h":
-                        hideTimings = true;
-                        break;
-
-                    case "-q":
-                        quietMode = true;
-                        break;
-
-                    case "-t":
-                        parseSuccess = ParseArgParam("-t", s => timeout = int.Parse(s), "a time in seconds");
-                        break;
-
-                    case "-m":
-                        parseSuccess = ParseArgParam("-m", requestedModels.Add, "a model alias");
-                        break;
-
-                    case "-s":
-                        parseSuccess = ParseArgParam("-s", s => maxSize = int.Parse(s), "a file size in MB");
-                        break;
-
-                    case "-i":
-                        parseSuccess = ParseArgParam("-i", ignoredModels.Add, "a model name or alias to ignore");
-                        break;
-
-                    case "-k":
-                        parseSuccess = ParseArgParam("-k", s => skipPast = s, "a model name or alias to skip past");
-                        break;
-
-                    default:
-                        localIgnoredArgs.Add(args[index]);
-                        break;
-                }
-
-                if (!parseSuccess)
-                {
-                    action = ProgramAction.Error;
-                    break;
-                }
-            }
-
-            ignoredArgs = localIgnoredArgs;
-            return new(action, new(requestedModels, maxSize, ignoredModels, tryAllVariants, ignoreToolSupport, skipPast, registeredEps, allowCpu),
-                requireToolUse, bruteForce, showVerbatimResponses, quietMode, hideTimings, timeout);
-
-            bool ParseArgParam(string param, Action<string> callback, string description)
-            {
-                if (index < args.Length - 1)
-                {
-                    ++index;
-                    callback(args[index]);
-                    return true;
-                }
-
-                Program.WriteLine($"`r{param} option needs {description}.", true);
-                localIgnoredArgs.Add(args[index]);
-                return false;
-            }
-        }
+        // Combos
+        Default = All ^ VerbatimOutput,
+        Quiet = ProgramOutput | ImportantInfo | Errors | FatalError,
+        SuperQuiet = ProgramOutput | FatalError,
     }
+
+    record class TimeActionResult<T>(T Value, TimeSpan Elapsed);
 }
