@@ -27,9 +27,18 @@ namespace ToolCallingScratch
             {
                 Console.WriteLine($"Failed EPs: {string.Join(", ", eps.FailedEps)}");
             }
-            Console.Write("Use [o]ld API or [n] API? ");
-            var c = Console.Read();
-            Console.WriteLine();
+
+            int c;
+            if (args.Length >= 2)
+            {
+                c = args[1][0];
+            }
+            else
+            {
+                Console.Write("Use [o]ld API or [n] API? ");
+                c = Console.Read();
+                Console.WriteLine();
+            }
 
             const int timeout = 3;
             bool finished = false;
