@@ -246,15 +246,15 @@ namespace ToolCallingScratch
             WriteLine($"`yListing models for this device that match your criteria.{Environment.NewLine}");
 
             WriteLine($"`w{"Alias",30} | Device | {"Execution Provider",-25} | Id ", OutputModes.ProgramOutput);
-            WriteLine($"`w{new string(' ', 23)}{new string('-', 8)}+{new string('-', 8)}+{new string('-', 27)}+{new string('-', 6)}", OutputModes.ProgramOutput);
+            WriteLine($"`w{new string(' ', 23)}{new string('-', 8)}+{new string('-', 8)}+{new string('-', 27)}+{new string('-', 5)}", OutputModes.ProgramOutput);
 
             await EnumerateAllCandidateModelsAsync(catalog, filteredResult =>
             {
                 if (filteredResult.MatchKind == ModelMatchKind.Matched)
                 {
                     var model = filteredResult.Model;
-                    WriteLine($"`w{filteredResult.Model.Alias,30} |  {GetDeviceTypeInColor(model)}   `w| "
-                        + $"`y{model.Info.Runtime!.ExecutionProvider,-25} `w| `d[{model.Id}]", OutputModes.ProgramOutput);
+                    WriteLine($"`w{filteredResult.Model.Alias,30} |   {GetDeviceTypeInColor(model)}  `w| "
+                        + $"`y{model.Info.Runtime!.ExecutionProvider,-25} `w| `o{model.Id}", OutputModes.ProgramOutput);
 
                     ++total;
                 }
@@ -328,9 +328,9 @@ namespace ToolCallingScratch
 
             void WriteHeader()
             {
-                WriteLine($"`w{"",30} |  Avg  |    Avg    |        |", OutputModes.ProgramOutput);
-                WriteLine($"`w{"Alias",30} | Grade | {"Time (ms)",9} | Device | EP [name] ", OutputModes.ProgramOutput);
-                WriteLine($"`w{new string(' ', 23)}{new string('-', 8)}+{new string('-', 7)}+{new string('-', 11)}+{new string('-', 8)}+{new string('-', 12)}", OutputModes.ProgramOutput);
+                WriteLine($"`w{"",30} |  Avg  |    Avg    |        | {"",25} |", OutputModes.ProgramOutput);
+                WriteLine($"`w{"Alias",30} | Grade | {"Time (ms)",9} | Device | {"Execution Provider",-25} | Id", OutputModes.ProgramOutput);
+                WriteLine($"`w{new string(' ', 23)}{new string('-', 8)}+{new string('-', 7)}+{new string('-', 11)}+{new string('-', 8)}+{new string('-', 27)}+{new string('-', 5)}", OutputModes.ProgramOutput);
             }
 
             void HandleOneResult(TestSuiteResults result)
@@ -352,7 +352,7 @@ namespace ToolCallingScratch
                 var model = result.FilterResult.Model;
                 WriteLine($"`w{model.Alias,30}`w |   {GetGradeInColor(result.AverageGrade)}`w   | "
                     + $"{result.AverageTime.TotalMilliseconds,9:N0} |   {GetDeviceTypeInColor(model)}`w  | "
-                    + $"`d{model.Info.Runtime!.ExecutionProvider} [{model.Info.Name}]", OutputModes.ProgramOutput);
+                    + $"`y{model.Info.Runtime!.ExecutionProvider,-25} | `o{model.Id}", OutputModes.ProgramOutput);
             }
         }
 
