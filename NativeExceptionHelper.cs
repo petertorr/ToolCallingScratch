@@ -223,5 +223,15 @@ namespace ToolCallingScratch.CrashDetection
 
             vectorRegistration = Win32.AddVectoredExceptionHandler(1, VectoredHandler);
         }
+
+        internal static void RemoveExceptionHandling()
+        {
+            if (vectorRegistration == IntPtr.Zero)
+            {
+                return;
+            }
+
+            Win32.RemoveVectoredExceptionHandler(vectorRegistration);
+        }
     }
 }

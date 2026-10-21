@@ -9,9 +9,9 @@
       "commandName": "Project",
       "commandLineArgs": "run"
     },
-    "stuff": {
+    "list": {
       "commandName": "Project",
-      "commandLineArgs": "list -h",
+      "commandLineArgs": "list -v -m qwen2.5-1.5b -m qwen 3.5-2b -b",
       "hotReloadEnabled": true,
       "debugEngines": "managed,native"
     }

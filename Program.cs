@@ -99,8 +99,18 @@ namespace ToolCallingScratch
 
         static async Task<int> Main(string[] args)
         {
-            NativeExceptionHelper.SetupExceptionHandling();
-
+            try
+            {
+                NativeExceptionHelper.SetupExceptionHandling();
+                return await MainImpl(args);
+            }
+            finally
+            {
+                NativeExceptionHelper.RemoveExceptionHandling();
+            }
+        }
+        static async Task<int> MainImpl(string[] args)
+        { 
             WriteLine($"`w{exeName} ({RuntimeInformation.ProcessArchitecture})", OutputModes.Status);
 
             options = Options.Parse(args, out var ignoredArgs);
@@ -234,13 +244,17 @@ namespace ToolCallingScratch
         {
             int total = 0;
             WriteLine($"`yListing models for this device that match your criteria.{Environment.NewLine}");
+
+            WriteLine($"`w{"Alias",30} | Device | {"Execution Provider",-25} | Id ", OutputModes.ProgramOutput);
+            WriteLine($"`w{new string(' ', 23)}{new string('-', 8)}+{new string('-', 8)}+{new string('-', 27)}+{new string('-', 6)}", OutputModes.ProgramOutput);
+
             await EnumerateAllCandidateModelsAsync(catalog, filteredResult =>
             {
                 if (filteredResult.MatchKind == ModelMatchKind.Matched)
                 {
                     var model = filteredResult.Model;
-                    WriteLine($"`w{filteredResult.Model.Alias,30} ({GetDeviceTypeInColor(model)}) "
-                        + $"`y{model.Info.Runtime!.ExecutionProvider,-25} `d[{model.Info.Name}]", OutputModes.ProgramOutput);
+                    WriteLine($"`w{filteredResult.Model.Alias,30} |  {GetDeviceTypeInColor(model)}   `w| "
+                        + $"`y{model.Info.Runtime!.ExecutionProvider,-25} `w| `d[{model.Id}]", OutputModes.ProgramOutput);
 
                     ++total;
                 }
