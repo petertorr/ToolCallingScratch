@@ -8,22 +8,24 @@ namespace ToolCallingScratch
 {
     internal class Program
     {
-        static async Task<int> Main(string[] args)
-        {
-            string modelName = args.FirstOrDefault() ?? "qwen2.5-1.5bb";
-            Console.WriteLine("Initializing... might take a few minutes.");
-            await FoundryLocalManager.CreateAsync(new() { AppName = "ToolCallingScratch" }, NullLogger.Instance);
-            using var instance = FoundryLocalManager.Instance;
-            var eps = await instance.DownloadAndRegisterEpsAsync();
-            var model = (await (await instance.GetCatalogAsync()).GetModelAsync(modelName))!;
-            await (model.DownloadAsync());
-            await model.LoadAsync();
+static async Task<int> Main(string[] args)
+{
+    string modelName = "qwen2.5-7b";
+    Console.WriteLine("Initializing... might take a few minutes.");
+    await FoundryLocalManager.CreateAsync(new() { AppName = "ToolCallingScratch" }, NullLogger.Instance);
+    using var instance = FoundryLocalManager.Instance;
+    var eps = await instance.DownloadAndRegisterEpsAsync();
+    var model = (await (await instance.GetCatalogAsync()).GetModelAsync(modelName))!;
+    Console.WriteLine($"Got model {model.Info.Id} from catalog.");
+    await model.DownloadAsync();
+    await model.LoadAsync();
+    Console.WriteLine($"Loaded!");
             var client = await model.GetChatClientAsync();
             client.Settings.Temperature = 0f;
 
             List<ChatMessage> messages = [
                 new("system", "You provide weather forecast information using a tool."),
-            new("user", "What is the weather in Seattle?")
+    new("user", "What is the weather in Seattle?")
             ];
 
             var tool = ToolDefinition.DefineFunction(
@@ -39,12 +41,12 @@ namespace ToolCallingScratch
             await RunOnePromptAsync(true, client, messages, tool);
 
             return 1;
-        }
+}
 
         static async Task RunOnePromptAsync(bool required, OpenAIChatClient client, List<ChatMessage> messages, ToolDefinition tool)
         {
             Console.WriteLine($"{Environment.NewLine}Mode: {(required ? "required" : "auto")}");
-            client.Settings.ToolChoice = required ? ToolChoice.Required : ToolChoice.Auto;
+            client.Settings.ToolChoice = required ? Betalgo.Ranul.OpenAI.ObjectModels.RequestModels.ToolChoice.Required : Betalgo.Ranul.OpenAI.ObjectModels.RequestModels.ToolChoice.Auto;
 
             var reply = (await client.CompleteChatAsync(messages, [tool])).Choices[0];
             Console.WriteLine($"Verbatim response:{Environment.NewLine}{reply.Message.Content}");
